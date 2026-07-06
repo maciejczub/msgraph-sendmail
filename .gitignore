@@ -1,0 +1,32 @@
+# Secrets — never commit credentials
+keys.txt
+.env
+.env.*
+!.env.example
+msgraph-sendmail.conf
+*.conf.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.tox/
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
