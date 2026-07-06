@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "msgraph-sendmail"
+version = "1.0.0"
+description = "Drop-in sendmail replacement that delivers mail through the Microsoft Graph API"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Maciej Czub" }]
+keywords = [
+  "sendmail", "microsoft-graph", "office365", "exchange-online",
+  "email", "smtp-replacement", "mta",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Communications :: Email",
+  "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Homepage = "https://github.com/maciejczub/msgraph-sendmail"
+Issues = "https://github.com/maciejczub/msgraph-sendmail/issues"
+
+[project.scripts]
+msgraph-sendmail = "msgraph_sendmail:main"
+
+[tool.setuptools]
+py-modules = ["msgraph_sendmail"]
