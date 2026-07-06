@@ -1,0 +1,109 @@
+.TH MSGRAPH-SENDMAIL 1 "July 2026" "msgraph-sendmail 1.0.0" "User Commands"
+.SH NAME
+msgraph-sendmail \- send mail through the Microsoft Graph API
+.SH SYNOPSIS
+.B msgraph-sendmail
+[\fB\-t\fR] [\fB\-i\fR] [\fB\-f\fR \fIfrom\fR] [\fIsendmail options\fR...] [\fIrecipient\fR...]
+.br
+.B msgraph-sendmail
+\fB\-\-to\fR \fIaddr\fR [\fB\-\-subject\fR \fItext\fR] [\fB\-\-body\fR \fItext\fR] [\fIoptions\fR...]
+.SH DESCRIPTION
+.B msgraph-sendmail
+is a drop-in replacement for the classic
+.BR sendmail (8)
+binary that submits mail to Microsoft Exchange Online through the
+Microsoft Graph API over HTTPS, using an Entra ID app registration with
+the
+.B Mail.Send
+application permission (OAuth 2.0 client credentials flow).
+.PP
+In the default
+.I sendmail mode
+it reads an RFC 822/MIME message from standard input. In
+.I CLI mode
+(activated by any long message option such as \fB\-\-to\fR) it builds the
+message from command-line arguments.
+.SH SENDMAIL MODE OPTIONS
+.TP
+.B \-t
+Read recipients from the To:, Cc: and Bcc: headers. Bcc recipients are
+honoured but not disclosed.
+.TP
+.BI \-f " address" ", \-r " address
+Set the sender mailbox. Overrides the From: header and the configured
+default.
+.TP
+.B \-i, \-oi
+Do not treat a line consisting of a single dot as end of input.
+.TP
+.B \-v
+Verbose output on standard error.
+.PP
+All other traditional sendmail options are accepted and ignored for
+compatibility.
+.SH CLI MODE OPTIONS
+.TP
+.BI \-\-to " addr"
+Add recipient(s); repeatable, accepts comma-separated lists.
+.TP
+.BI \-\-cc " addr" ", \-\-bcc " addr ", \-\-reply\-to " addr
+Add Cc/Bcc/Reply-To recipients.
+.TP
+.BI \-\-subject " text"
+Message subject.
+.TP
+.BI \-\-body " text" ", \-\-body\-file " file
+Message body. When neither is given, the body is read from stdin.
+.TP
+.B \-\-html
+Treat the body as HTML.
+.TP
+.BI \-\-attach " file"
+Attach a file; repeatable.
+.SH COMMON OPTIONS
+.TP
+.BI \-\-from " addr"
+Sender mailbox.
+.TP
+.BI \-\-config " file"
+Use an alternate configuration file.
+.TP
+.B \-\-save\-to\-sent, \-\-no\-save\-to\-sent
+Keep (or don't keep) a copy in the sender's Sent Items folder.
+Default: keep.
+.TP
+.B \-\-dry\-run
+Print the Graph API payload instead of sending.
+.TP
+.B \-\-verbose, \-\-version, \-\-help
+The usual.
+.SH CONFIGURATION
+Read from the first of:
+.BR \-\-config ,
+.BR $MSGRAPH_SENDMAIL_CONFIG ,
+.IR ~/.config/msgraph\-sendmail.conf ,
+.IR /etc/msgraph\-sendmail.conf .
+INI format, section [msgraph], keys:
+.BR tenant ,
+.BR client_id ,
+.BR client_secret ,
+.BR client_secret_file ,
+.BR from ,
+.BR save_to_sent ,
+.BR timeout .
+Environment variables
+.B MSGRAPH_SENDMAIL_TENANT
+etc. override the file. The file contains a secret; keep it mode 600.
+.SH EXIT STATUS
+BSD sysexits: 0 success, 64 usage error, 65 bad message, 69 service
+refused (auth/permissions), 75 temporary failure (retry), 78
+configuration error.
+.SH FILES
+.I /etc/msgraph\-sendmail.conf
+.br
+.I ~/.config/msgraph\-sendmail.conf
+.SH SEE ALSO
+.BR sendmail (8)
+.PP
+Full documentation:
+.I https://github.com/maciejczub/msgraph\-sendmail
