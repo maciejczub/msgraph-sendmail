@@ -21,6 +21,9 @@ HTTPS via Graph.
 - Single file, **Python 3.8+ standard library only** — no pip dependencies
 - App-only authentication (OAuth 2.0 client credentials) — no user
   interaction, no password storage, works headless
+- Local addresses handled like an MTA: mail to `root`, cron job owners or
+  `www-data@thishost` is mapped via `[aliases]`, `/etc/aliases` and a
+  catch-all `local_recipient`; check it with `-bv`
 - Automatic retry with backoff on throttling (HTTP 429) and server errors
 - Meaningful `sysexits` exit codes and syslog logging (mail facility)
 
@@ -106,7 +109,10 @@ echo "backup finished" | msgraph-sendmail -f robot@example.com admin@example.com
 
 Supported sendmail options: `-t` (recipients from headers), `-f`/`-r`
 (envelope sender), `-i`/`-oi` (don't treat a lone `.` as end of input),
-`-v` (verbose). All other classic options (`-F`, `-o…`, `-q…`, `-B`, …) are
+`-v` (verbose), `-bv` (verify: show where each address would go, send
+nothing), `-bi`/`-bp` (no-ops: no alias database, no queue). `-bs` (SMTP
+on stdin) is not supported — configure such mailers to use `-t -i`. All
+other classic options (`-F`, `-o…`, `-q…`, `-B`, …) are
 accepted and ignored, so existing callers don't break.
 
 ### CLI mode

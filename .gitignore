@@ -4,6 +4,7 @@ keys.txt
 .env.*
 !.env.example
 msgraph-sendmail.conf
+!examples/msgraph-sendmail.conf
 *.conf.local
 
 # Python

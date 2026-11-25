@@ -33,6 +33,7 @@ import json
 import mimetypes
 import os
 import re
+import socket
 import ssl
 import stat
 import sys
@@ -58,6 +59,7 @@ MAX_REQUEST_BYTES = 4 * 1024 * 1024
 EX_OK = 0
 EX_USAGE = 64        # command line usage error
 EX_DATAERR = 65      # message could not be parsed / was rejected as invalid
+EX_NOUSER = 67       # addressee unknown (local address without an alias)
 EX_UNAVAILABLE = 69  # service refused us (authentication, permissions)
 EX_TEMPFAIL = 75     # temporary failure, retry later (network, throttling)
 EX_CONFIG = 78       # configuration missing or broken
@@ -69,6 +71,9 @@ CONFIG_PATHS = (
 )
 
 ENV_PREFIX = "MSGRAPH_SENDMAIL_"
+
+DEFAULT_ALIASES_FILE = "/etc/aliases"
+MAX_ALIASES_BYTES = 1024 * 1024
 
 
 class UserError(Exception):
@@ -130,18 +135,56 @@ class Config:
         self.save_to_sent: bool = True
         self.timeout: float = 30.0
         self.source: str | None = None  # where the config came from
+        # Local address handling (see AddressResolver).
+        self.local_recipient: str | None = None
+        self.aliases_file: str = DEFAULT_ALIASES_FILE  # "" disables
+        self.local_domains: set[str] | None = None     # None = automatic
+        self.aliases: dict[str, list[str]] = {}       # [aliases] section
+
+
+def _config_error_summary(exc: configparser.Error) -> str:
+    """Describe a ConfigParser error WITHOUT quoting file content: the
+    library's own messages include the offending line or value, which may
+    be the client secret, and errors go to stderr and syslog."""
+    if isinstance(exc, configparser.InterpolationError):
+        return (f"invalid '%' in option {exc.option!r} of section "
+                f"[{exc.section}] (write %% for a literal %)")
+    if isinstance(exc, configparser.MissingSectionHeaderError):
+        return f"line {exc.lineno}: missing section header such as [msgraph]"
+    if isinstance(exc, configparser.ParsingError):
+        lines = ", ".join(str(error[0]) for error in exc.errors)
+        return f"syntax error on line(s) {lines}"
+    if isinstance(exc, configparser.DuplicateOptionError):
+        return (f"line {exc.lineno}: option {exc.option!r} appears twice "
+                f"in section [{exc.section}]")
+    if isinstance(exc, configparser.DuplicateSectionError):
+        return f"line {exc.lineno}: section [{exc.section}] appears twice"
+    return type(exc).__name__
 
 
 def _read_config_file(path: str, cfg: Config) -> None:
     parser = configparser.ConfigParser()
+    # A second, literal view of the file without [DEFAULT] inheritance,
+    # used only to learn which options are physically in [aliases].
+    literal = configparser.ConfigParser(
+        default_section="msgraph-sendmail:no-defaults", interpolation=None)
     try:
         with open(path, encoding="utf-8") as fh:
-            parser.read_file(fh)
+            text = fh.read()
     except OSError as exc:
         raise UserError(f"cannot read config file {path}: {exc}", EX_CONFIG)
+    try:
+        parser.read_string(text, source=path)
+        literal.read_string(text, source=path)
+        _apply_config_section(parser, literal, path, cfg)
     except configparser.Error as exc:
-        raise UserError(f"cannot parse config file {path}: {exc}", EX_CONFIG)
+        raise UserError(f"cannot parse config file {path}: "
+                        f"{_config_error_summary(exc)}", EX_CONFIG)
 
+
+def _apply_config_section(parser: configparser.ConfigParser,
+                          literal: configparser.ConfigParser, path: str,
+                          cfg: Config) -> None:
     if parser.has_section("msgraph"):
         section = parser["msgraph"]
     else:
@@ -169,6 +212,22 @@ def _read_config_file(path: str, cfg: Config) -> None:
             cfg.timeout = float(section["timeout"])
         except ValueError:
             raise UserError(f"invalid timeout in {path}", EX_CONFIG)
+    if "local_recipient" in section:
+        cfg.local_recipient = section["local_recipient"].strip() or None
+    if "aliases_file" in section:
+        cfg.aliases_file = section["aliases_file"].strip()
+    if "local_domains" in section:
+        cfg.local_domains = {
+            domain.lower()
+            for domain in re.split(r"[\s,]+", section["local_domains"])
+            if domain
+        }
+    if literal.has_section("aliases"):
+        # Only options written in [aliases] itself — never values
+        # inherited from [DEFAULT] (which may hold the client secret).
+        for name in literal.options("aliases"):
+            value = parser.get("aliases", name)
+            cfg.aliases[name.lower()] = _split_alias_targets(value)
     cfg.source = path
 
     _warn_if_world_readable(path, bool(section.get("client_secret")))
@@ -214,8 +273,29 @@ def load_config(explicit_path: str | None) -> Config:
         except OSError as exc:
             raise UserError(f"cannot read client secret file: {exc}", EX_CONFIG)
     cfg.default_from = env.get(ENV_PREFIX + "FROM", cfg.default_from)
+    cfg.local_recipient = env.get(ENV_PREFIX + "LOCAL_RECIPIENT",
+                                  cfg.local_recipient) or None
+    cfg.aliases_file = env.get(ENV_PREFIX + "ALIASES_FILE", cfg.aliases_file)
 
+    cfg.default_from = _single_address(cfg.default_from, "from")
+    cfg.local_recipient = _single_address(cfg.local_recipient,
+                                          "local_recipient")
     return cfg
+
+
+def _single_address(value: str | None, key: str) -> str | None:
+    """Validate a configured mailbox ("a@b" or "Name <a@b>") and reduce it
+    to the bare address: exactly one address with a local part and a
+    domain."""
+    if not value or not value.strip():
+        return None
+    parsed = email.utils.getaddresses([value])
+    address = parsed[0][1] if len(parsed) == 1 else ""
+    local, at, domain = address.rpartition("@")
+    if not (at and local and domain):
+        raise UserError(f"{key} must be exactly one full address "
+                        f"(user@domain), not {value!r}", EX_CONFIG)
+    return address
 
 
 def require_config(cfg: Config) -> None:
@@ -251,6 +331,8 @@ class Options:
         self.dry_run = False
         self.verbose = False
         self.save_to_sent: bool | None = None
+        self.verify = False                    # -bv: only show resolution
+        self.noop_mode: str | None = None      # -bi / -bp
         # CLI mode fields
         self.to: list[str] = []
         self.cc: list[str] = []
@@ -266,6 +348,7 @@ class Options:
 USAGE = f"""\
 usage (sendmail mode):
   {PROG} [-t] [-i] [-f from] [sendmail options...] [recipient...] < message
+  {PROG} -bv recipient...      show how (local) addresses resolve
 
 usage (CLI mode):
   {PROG} --to ADDR [--to ADDR ...] [--cc ADDR] [--bcc ADDR]
@@ -355,7 +438,7 @@ def parse_args(argv: list[str]) -> Options:
         i += 1
 
     if opts.mode == "cli" and (opts.read_recipients_from_headers
-                               or opts.recipients):
+                               or opts.recipients or opts.verify):
         raise UserError(
             "cannot mix CLI options (--to/--subject/...) with sendmail-style "
             "recipients or -t", EX_USAGE)
@@ -436,6 +519,23 @@ def _parse_sendmail_option(opts: Options, argv: list[str], i: int) -> int:
             opts.from_addr = argv[i]
     elif letter == "v":
         opts.verbose = True
+    elif letter == "b":
+        # -bX / -b X: operating mode.  Only -bv (verify) is special.
+        mode = rest
+        if not mode:
+            if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                raise UserError("option -b requires a mode (e.g. -bv)",
+                                EX_USAGE)
+            i += 1
+            mode = argv[i]
+        if mode == "v":
+            opts.verify = True
+        elif mode in ("i", "p"):
+            opts.noop_mode = mode   # newaliases / mailq
+        elif mode != "m":
+            raise UserError(
+                f"sendmail mode -b{mode} is not supported; submit the "
+                f"message on stdin with -t or recipient arguments", EX_USAGE)
     elif letter in _SENDMAIL_VALUE_OPTS:
         # Takes a value; swallow the next argument when none is attached.
         if not rest and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
@@ -642,6 +742,387 @@ def message_from_cli(opts: Options) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Local addresses: aliases, local_recipient fallback
+# ---------------------------------------------------------------------------
+
+def _split_alias_targets(value: str) -> list[str]:
+    """Split an alias value into targets on commas, honouring double quotes
+    (with backslash escapes) and RFC 5322 comments in parentheses.
+
+    Pipe, file and :include: targets are returned verbatim (unquoted);
+    everything else is reduced to a bare address with comments removed.
+    Unparseable targets are dropped.
+    """
+    tokens: list[str] = []
+    current: list[str] = []
+    quoted = False
+    escaped = False
+    depth = 0
+    for char in value:
+        if escaped:
+            escaped = False
+        elif char == "\\" and (quoted or depth):
+            escaped = True
+        elif char == '"' and not depth:
+            quoted = not quoted
+        elif char == "(" and not quoted:
+            depth += 1
+        elif char == ")" and not quoted and depth:
+            depth -= 1
+        elif char == "," and not quoted and not depth:
+            tokens.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    tokens.append("".join(current))
+
+    targets = []
+    for token in (t.strip() for t in tokens):
+        if not token:
+            continue
+        if len(token) > 1 and token[0] == token[-1] == '"' \
+                and token[1:2] in ("|", "/", ":"):
+            token = token[1:-1]
+        if token.startswith(("|", "/", ":include:")):
+            targets.append(token)
+            continue
+        words = token.split()
+        if len(words) > 1 and not any(c in token for c in '<"(') \
+                and all(_is_complete_address(word) for word in words):
+            # "a@x b@y": bare addresses separated only by whitespace
+            # (typically a continuation line without a trailing comma).
+            parts = words
+        else:
+            parts = [token]  # e.g. a mailbox folded as "ops@" / "x.org"
+        for part in parts:
+            _, address = email.utils.parseaddr(part)
+            if address:
+                targets.append(address)
+            else:
+                debug("aliases: ignoring unparseable target")
+    return targets
+
+
+def _is_complete_address(word: str) -> bool:
+    """A bare local name, or user@domain with both halves present."""
+    if "@" not in word:
+        return True
+    local, _, domain = word.rpartition("@")
+    return bool(local) and bool(domain) and not local.endswith("@")
+
+
+def parse_aliases(text: str) -> dict[str, list[str]]:
+    """Parse aliases(5) syntax: ``name: target, target`` with continuation
+    lines (leading whitespace) and ``#`` comments.  Names are lower-cased;
+    the first definition of a name wins, as with newaliases."""
+    entries: list[tuple[str, str]] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line[0] in " \t":
+            if entries:
+                name, value = entries[-1]
+                entries[-1] = (name, value + " " + line.strip())
+            continue
+        name, colon, value = line.partition(":")
+        name = name.strip().strip('"').lower()
+        if not colon or not name:
+            # Never echo the line itself: it may come from a file that
+            # holds secrets (e.g. a misconfigured aliases_file).
+            debug(f"aliases: ignoring malformed line {lineno}")
+            continue
+        entries.append((name, value))
+
+    aliases: dict[str, list[str]] = {}
+    for name, value in entries:
+        if name in aliases:
+            debug(f"aliases: duplicate entry for {name!r} ignored")
+            continue
+        aliases[name] = _split_alias_targets(value)
+    return aliases
+
+
+def _norm_domain(domain: str) -> str:
+    """Lower-case and drop a trailing root dot.  Deliberately no IDNA
+    mapping: IDNA 2003 folds distinct names (faß -> fass), list both the
+    Unicode and the xn-- form in local_domains if you need them."""
+    return domain.strip().lower().rstrip(".")
+
+
+def _read_aliases_file(path: str) -> str | None:
+    """Read a system aliases file defensively; None if it does not exist.
+
+    The file decides where mail for root goes, so it must be a regular
+    file owned by root or the invoking user and not writable by others;
+    it is opened non-blocking (a FIFO cannot hang us) and size-capped.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise UserError(f"cannot read aliases file {path}: {exc}", EX_CONFIG)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise UserError(f"aliases file {path} is not a regular file",
+                            EX_CONFIG)
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) \
+                or st.st_uid not in (0, os.geteuid()):
+            raise UserError(
+                f"refusing to use aliases file {path}: it must be owned by "
+                f"root (or you) and not writable by group/others", EX_CONFIG)
+        if st.st_size > MAX_ALIASES_BYTES:
+            raise UserError(f"aliases file {path} is larger than "
+                            f"{MAX_ALIASES_BYTES // 1024} KiB", EX_CONFIG)
+        chunks = []
+        remaining = MAX_ALIASES_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if remaining <= 0:
+            raise UserError(f"aliases file {path} is larger than "
+                            f"{MAX_ALIASES_BYTES // 1024} KiB", EX_CONFIG)
+    except OSError as exc:
+        raise UserError(f"cannot read aliases file {path}: {exc}", EX_CONFIG)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
+class AddressResolver:
+    """Map local addresses (``root``, ``root@localhost``, ``www-data@host``)
+    to real mailboxes the way an MTA would: [aliases] from the config, then
+    the system aliases file, then the ``local_recipient`` catch-all.
+    Addresses that are not local pass through unchanged."""
+
+    MAX_DEPTH = 100
+    MAX_EXPANSION_STEPS = 1_000_000  # alias targets visited per message
+
+    def __init__(self, cfg: Config, hostname: str | None = None,
+                 getfqdn=None) -> None:
+        self.cfg = cfg
+        self._hostname = _norm_domain(hostname if hostname is not None
+                                      else socket.gethostname())
+        self._getfqdn = getfqdn or socket.getfqdn
+        self._fqdn: str | None = None
+        self._system_aliases: dict[str, list[str]] | None = None
+        self._cache: dict[str, list[str] | None] = {}  # per top-level name
+        self._pure: dict[str, list[str] | None] = {}   # see _walk()
+        self._steps = 0
+        self.rewritten: list[str] = []   # original local addresses
+        self.discarded: list[str] = []   # local addresses aliased to /dev/null
+
+    # -- what is local -----------------------------------------------------
+
+    def _fqdn_value(self) -> str:
+        if self._fqdn is None:
+            try:
+                self._fqdn = _norm_domain(self._getfqdn() or "")
+            except OSError:
+                self._fqdn = ""
+        return self._fqdn
+
+    def _is_local_domain(self, domain: str) -> bool:
+        domain = _norm_domain(domain)
+        if self.cfg.local_domains is not None:
+            return domain in {_norm_domain(d) for d in self.cfg.local_domains}
+        if self.cfg.default_from:
+            _, sender = email.utils.parseaddr(self.cfg.default_from)
+            if "@" in sender and \
+                    domain == _norm_domain(sender.rpartition("@")[2]):
+                return False  # the real mail domain is never "local"
+        short = self._hostname.split(".")[0]
+        if domain in ("localhost", "localhost.localdomain", short,
+                      self._hostname):
+            return True
+        # Only pay for a (possibly DNS-backed) FQDN lookup when the domain
+        # could plausibly be this host's FQDN.
+        if short and domain.startswith(short + "."):
+            return domain == self._fqdn_value()
+        return False
+
+    def is_local(self, address: str) -> bool:
+        _, at, domain = address.rpartition("@")
+        if not at:
+            return True
+        return self._is_local_domain(domain)
+
+    # -- alias lookup ------------------------------------------------------
+
+    def _system(self) -> dict[str, list[str]]:
+        if self._system_aliases is None:
+            self._system_aliases = {}
+            if self.cfg.aliases_file:
+                text = _read_aliases_file(self.cfg.aliases_file)
+                if text is not None:
+                    self._system_aliases = parse_aliases(text)
+        return self._system_aliases
+
+    def _lookup(self, name: str) -> list[str] | None:
+        if name in self.cfg.aliases:
+            return self.cfg.aliases[name]
+        return self._system().get(name)
+
+    def _fallback(self) -> list[str] | None:
+        catch_all = self.cfg.local_recipient
+        if not catch_all:
+            return None
+        if self.is_local(catch_all):
+            raise UserError(
+                f"local_recipient {catch_all!r} is itself a local address; "
+                f"it must be a real mailbox", EX_CONFIG)
+        return [catch_all]
+
+    def _walk(self, name: str, depth: int, out: list[str], seen: set[str],
+              path: dict[str, int], done: set[str]) -> tuple[bool, int]:
+        """Depth-first expansion of one local name into *out*.
+
+        *path* maps the names on the current path to their depth; *done*
+        holds names already expanded into *out* during this resolve().
+        Returns (deliverable, low): *low* is the smallest path depth this
+        subtree referred back to.  A subtree that never refers above its
+        own root (low >= depth) has a context-independent result, which is
+        cached and reused — so a big list behind many aliases is expanded
+        once per message, and cyclic results never depend on lookup order.
+        """
+        if name in self._pure:
+            return self._add(self._pure[name], out, seen), depth
+        if depth >= self.MAX_DEPTH:
+            raise UserError(
+                f"alias nesting deeper than {self.MAX_DEPTH} levels "
+                f"(at {name!r}); check the aliases", EX_CONFIG)
+        path[name] = depth
+        low = depth + 1  # "no back reference"
+        mine: list[str] = []
+        mine_seen: set[str] = set()
+        targets = self._lookup(name)
+        if targets is None:
+            ok = self._add(self._fallback(), mine, mine_seen)
+        else:
+            ok = True
+            usable = False
+            for target in targets:
+                self._spend()
+                if target == "/dev/null":
+                    usable = True  # explicit discard
+                    continue
+                if target.startswith(("|", "/", ":include:")):
+                    debug(f"alias {name}: skipping undeliverable target "
+                          f"{target!r}")
+                    continue
+                usable = True
+                if not self.is_local(target):
+                    self._add([target], mine, mine_seen)
+                    continue
+                target_name = (target.rpartition("@")[0] or target).lower()
+                if target_name in path:
+                    # Self reference / loop: "the local mailbox".
+                    low = min(low, path[target_name])
+                    ok = self._add(self._fallback(), mine, mine_seen)
+                elif target_name in self._pure or target_name not in done:
+                    ok, child_low = self._walk(target_name, depth + 1, mine,
+                                               mine_seen, path, done)
+                    low = min(low, child_low)
+                else:
+                    # Expanded earlier in this resolve() but context-
+                    # dependent: its addresses are already in *out*, yet
+                    # *mine* lacks them, so this result must not be cached.
+                    low = -1
+                if not ok:
+                    break
+            ok = ok and usable
+        del path[name]
+        done.add(name)
+        if low >= depth:
+            self._pure[name] = mine if ok else None
+        if ok:
+            self._add(mine, out, seen)
+        return ok, low
+
+    def _spend(self) -> None:
+        self._steps += 1
+        if self._steps > self.MAX_EXPANSION_STEPS:
+            raise UserError(
+                f"alias expansion exceeds {self.MAX_EXPANSION_STEPS} steps "
+                f"for this message; check the aliases", EX_CONFIG)
+
+    @staticmethod
+    def _add(addresses: list[str] | None, out: list[str],
+             seen: set[str]) -> bool:
+        if addresses is None:
+            return False
+        for address in addresses:
+            if address.lower() not in seen:
+                seen.add(address.lower())
+                out.append(address)
+        return True
+
+    def resolve(self, address: str) -> list[str] | None:
+        """Return the real addresses for *address* ([] when it is aliased
+        to /dev/null), or None when it is a local address that cannot be
+        delivered."""
+        if not self.is_local(address):
+            return [address]
+        name = (address.rpartition("@")[0] or address).lower()
+        if name not in self._cache:
+            out: list[str] = []
+            ok, _ = self._walk(name, 0, out, set(), {}, set())
+            self._cache[name] = out if ok else None
+            debug(f"local address {address} -> "
+                  + ("(undeliverable)" if not ok
+                     else ", ".join(out[:10]) or "(discarded)")
+                  + (" ..." if ok and len(out) > 10 else ""))
+        result = self._cache[name]
+        return None if result is None else list(result)
+
+    def resolve_recipients(self, entries: list[dict],
+                           reply_to: bool = False) -> list[dict]:
+        """Resolve Graph recipient objects; raise EX_NOUSER for local
+        addresses that cannot be resolved.  For *reply_to* lists,
+        unresolvable addresses are dropped instead and nothing is counted
+        as rewritten or discarded (Reply-To is not a delivery)."""
+        result: list[dict] = []
+        seen: set[str] = set()   # dedupe before building recipient objects
+        unresolved: list[str] = []
+
+        def add(entry: dict) -> None:
+            key = entry["emailAddress"]["address"].lower()
+            if key not in seen:
+                seen.add(key)
+                result.append(entry)
+
+        for entry in entries:
+            address = entry["emailAddress"]["address"]
+            if not self.is_local(address):
+                add(entry)
+                continue
+            resolved = self.resolve(address)
+            if resolved is None:
+                if reply_to:
+                    debug(f"dropping unresolvable local address {address}")
+                else:
+                    unresolved.append(address)
+                continue
+            if not reply_to:
+                (self.rewritten if resolved else self.discarded).append(
+                    address)
+            for target in resolved:
+                if target.lower() not in seen:
+                    add(_recipient(target))
+        if unresolved:
+            raise UserError(
+                "no mailbox for local address(es) "
+                + ", ".join(repr(a) for a in unresolved)
+                + ": add them to the [aliases] section or the aliases file, "
+                  "or set local_recipient in the config", EX_NOUSER)
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Microsoft Graph HTTP client
 # ---------------------------------------------------------------------------
 
@@ -764,13 +1245,44 @@ def _extract_bare_address(value: str) -> str:
     return address or value
 
 
+def verify_addresses(resolver: AddressResolver, recipients: list[str]) -> int:
+    """sendmail -bv: report how each address resolves; send nothing."""
+    addresses = [address for _, address in
+                 email.utils.getaddresses(recipients) if address]
+    if not addresses:
+        raise UserError("-bv needs at least one address", EX_USAGE)
+    status = EX_OK
+    for address in addresses:
+        resolved = resolver.resolve(address)
+        if resolved is None:
+            print(f"{address}... User unknown (no alias and no "
+                  f"local_recipient)")
+            status = EX_NOUSER
+        elif not resolved:
+            print(f"{address}... deliverable: discarded (/dev/null)")
+        else:
+            print(f"{address}... deliverable: {', '.join(resolved)}")
+    return status
+
+
 def run(argv: list[str]) -> int:
     global _VERBOSE
 
     opts = parse_args(argv)
     _VERBOSE = opts.verbose
 
+    if opts.noop_mode == "i":
+        debug("-bi (newaliases): nothing to do, aliases are read live")
+        return EX_OK
+    if opts.noop_mode == "p":
+        print("Mail queue is empty (msgraph-sendmail does not queue)")
+        return EX_OK
+
     cfg = load_config(opts.config_path)
+    resolver = AddressResolver(cfg)
+
+    if opts.verify:
+        return verify_addresses(resolver, opts.recipients)
 
     if opts.mode == "cli":
         graph_message = message_from_cli(opts)
@@ -783,20 +1295,49 @@ def run(argv: list[str]) -> int:
         mime_message = read_stdin_message(opts)
         graph_message, from_header = message_from_mime(mime_message, opts)
 
+    for key in ("toRecipients", "ccRecipients", "bccRecipients"):
+        if graph_message.get(key):
+            graph_message[key] = resolver.resolve_recipients(
+                graph_message[key])
+    if graph_message.get("replyTo"):
+        graph_message["replyTo"] = resolver.resolve_recipients(
+            graph_message["replyTo"], reply_to=True)
+        if not graph_message["replyTo"]:
+            del graph_message["replyTo"]
+
+    if resolver.discarded and not any(
+            graph_message.get(key) for key in
+            ("toRecipients", "ccRecipients", "bccRecipients")):
+        log_info("discarded: all recipients aliased to /dev/null ("
+                 + ", ".join(resolver.discarded) + ")")
+        return EX_OK
+
     if not graph_message.get("toRecipients") \
             and not graph_message.get("ccRecipients") \
             and not graph_message.get("bccRecipients"):
         raise UserError("message has no recipients", EX_DATAERR)
 
     # Which mailbox do we send from?  -f/--from wins, then the From:
-    # header, then the configured default.
+    # header, then the configured default.  Local addresses (root,
+    # www-data@host, ...) can never be a Graph mailbox and are skipped.
+    # A local -f (cron, daemons) means "system mail": go straight to the
+    # configured mailbox rather than trusting the From: header.
     mailbox = None
-    if opts.from_addr:
-        mailbox = _extract_bare_address(opts.from_addr)
-    elif from_header:
-        mailbox = from_header
-    elif cfg.default_from:
-        mailbox = cfg.default_from
+    explicit = _extract_bare_address(opts.from_addr) if opts.from_addr \
+        else None
+    if explicit and resolver.is_local(explicit):
+        debug(f"sender {explicit} is a local address; using configured from")
+        candidates = (cfg.default_from,)
+    else:
+        candidates = (explicit, from_header, cfg.default_from)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if resolver.is_local(candidate):
+            debug(f"sender {candidate} is a local address; skipping it")
+            continue
+        mailbox = candidate
+        break
     if not mailbox:
         raise UserError(
             "no sender address: use -f/--from, a From: header, or set "
@@ -822,7 +1363,9 @@ def run(argv: list[str]) -> int:
         for key in ("toRecipients", "ccRecipients", "bccRecipients")
         for entry in graph_message.get(key, [])
     )
-    log_info(f"sent from={mailbox} to={recipients_summary} "
+    orig = (f" orig_to={', '.join(resolver.rewritten)}"
+            if resolver.rewritten else "")
+    log_info(f"sent from={mailbox} to={recipients_summary}{orig} "
              f"subject={graph_message.get('subject', '')!r}")
     debug("message accepted by Microsoft Graph")
     return EX_OK

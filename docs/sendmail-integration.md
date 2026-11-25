@@ -7,7 +7,9 @@ submission. Here is how to wire it up.
 ## Prerequisites
 
 - Working config in `/etc/msgraph-sendmail.conf` including a `from`
-  address (system daemons usually don't set a usable `From:` header).
+  address (system daemons usually don't set a usable `From:` header) and
+  a `local_recipient` (or `[aliases]`) for mail addressed to `root` and
+  other local users — see [Local addresses](configuration.md#local-addresses).
 - No other MTA fighting for the path: remove or stop postfix/exim/ssmtp
   if they own `/usr/sbin/sendmail`, or use the alternatives system below.
 
@@ -15,6 +17,7 @@ Verify first:
 
 ```sh
 echo "test body" | msgraph-sendmail --to you@example.com --subject "pre-flight"
+msgraph-sendmail -bv root www-data      # where does local mail go?
 ```
 
 ## Option A: plain symlink
@@ -50,13 +53,20 @@ tail -f /var/log/mail.log   # success/failure is logged to the mail facility
 sendmail_path = /usr/local/bin/msgraph-sendmail -t -i
 ```
 
+Mailer libraries that default to `sendmail -bs` (SMTP over stdin, e.g.
+Symfony Mailer's `SendmailTransport`) must be switched to `-t -i`;
+msgraph-sendmail rejects `-bs` with exit code 64 instead of guessing.
+
 Note that PHP's fifth `mail()` parameter (`additional_params`) often passes
 `-f sender@domain`; that is honoured and selects the sending mailbox.
 
 ## Cron
 
-Cron pipes job output to `sendmail -i -FCronDaemon -oi -t` (flags vary by
-implementation) — all of these are understood or safely ignored. Set the
+Cron pipes job output to `sendmail -i -FCronDaemon -oi -t` (cronie) or
+`sendmail -FCronDaemon -i -B8BITMIME -oem <user>` (Debian/Ubuntu) — all of
+these flags are understood or safely ignored. By default the mail goes to
+the job owner (`root`, `deploy`, …), which is resolved through
+`[aliases]`, `/etc/aliases` and `local_recipient`. You can also set the
 recipient per crontab:
 
 ```cron
@@ -64,8 +74,8 @@ MAILTO=admin@example.com
 0 3 * * * /usr/local/bin/backup.sh
 ```
 
-Cron does not set a `From:` header address that Exchange would accept, so
-the `from` value in `/etc/msgraph-sendmail.conf` is what will be used.
+Cron's `From: root (Cron Daemon)` is a local address, so the `from` value
+in `/etc/msgraph-sendmail.conf` is used as the sending mailbox.
 
 ## Applications that speak SMTP only
 
@@ -96,6 +106,13 @@ directly is simpler and has fewer moving parts.)
   actual (To) recipients of the Graph message; with `-t` they are taken
   from `To:`/`Cc:`/`Bcc:` headers instead. `Bcc:` recipients are honoured
   and never appear in the delivered message.
-- **Aliases are not expanded.** `/etc/aliases` is not consulted; `root`
-  is not a valid Graph recipient. Use full addresses (cron `MAILTO`,
-  etc.).
+- **Local delivery is mapped, not performed.** Mail for `root` and other
+  local users is redirected to real mailboxes via `[aliases]`,
+  `/etc/aliases` and `local_recipient`; pipe/file/`:include:` alias
+  targets and `~/.forward` are not supported. A local recipient that
+  resolves to nothing fails the message (exit 67) rather than being
+  silently dropped.
+- **Replacing an ad-hoc wrapper.** If you previously put a script in
+  front of msgraph-sendmail to rewrite `root` (or similar), point
+  `/usr/sbin/sendmail` straight at msgraph-sendmail and move the mapping
+  into `[aliases]`/`local_recipient`.
