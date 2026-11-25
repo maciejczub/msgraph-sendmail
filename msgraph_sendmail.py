@@ -45,7 +45,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 PROG = "msgraph-sendmail"
 

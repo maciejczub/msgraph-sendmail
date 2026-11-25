@@ -4,7 +4,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.0] - 2026-11-25
+
+### Upgrading from 1.0
+- Set `local_recipient` (or `[aliases]`) if anything on the host mails
+  `root` or other local users — e.g. cron, mdadm, smartd. Without it such
+  mail fails with exit 67 (it already failed in 1.0, at Graph).
+- If you put a wrapper script in front of msgraph-sendmail to rewrite
+  `root`, point `/usr/sbin/sendmail` straight at msgraph-sendmail and
+  move the mapping into the config.
+- The default `timeout` drops from 30 to 15 s and a new overall
+  `max_time` of 50 s applies. Callers with a longer budget that relied on
+  long waits can raise `max_time` (or set `0` for no limit).
+- `-bs` and other unsupported `-b` modes now fail with exit 64 instead
+  of being ignored.
+- Config values containing a lone `%` were never valid; they are now
+  reported as exit 78 instead of a traceback.
 
 ### Added
 - Local address handling (#1): mail to `root`, Unix users and
@@ -82,3 +97,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Documentation: Entra ID setup guide (incl. application access policy),
   configuration reference, system integration guide (symlink,
   update-alternatives, PHP, cron, postfix bridge), man page.
+
+[1.1.0]: https://github.com/maciejczub/msgraph-sendmail/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/maciejczub/msgraph-sendmail/releases/tag/v1.0.0

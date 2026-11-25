@@ -37,8 +37,12 @@ HTTPS via Graph.
 **Straight copy (no packaging tools needed):**
 
 ```sh
+curl -fsSL -o msgraph_sendmail.py \
+  https://github.com/maciejczub/msgraph-sendmail/releases/latest/download/msgraph_sendmail.py
 install -m 755 msgraph_sendmail.py /usr/local/bin/msgraph-sendmail
 ```
+
+(or `install` it straight from a clone of this repository)
 
 **pipx / pip:**
 
@@ -73,6 +77,7 @@ tenant = contoso.com                # tenant GUID or a verified domain
 client_id = <application-client-id>
 client_secret = <client-secret-value>
 from = noreply@contoso.com          # default sender mailbox
+local_recipient = ops@contoso.com   # where mail for root & co. goes
 ```
 
 Configuration is looked up in this order:
@@ -81,12 +86,15 @@ Configuration is looked up in this order:
 Every value can also be supplied via environment variables
 (`MSGRAPH_SENDMAIL_TENANT`, `MSGRAPH_SENDMAIL_CLIENT_ID`,
 `MSGRAPH_SENDMAIL_CLIENT_SECRET`, `MSGRAPH_SENDMAIL_CLIENT_SECRET_FILE`,
-`MSGRAPH_SENDMAIL_FROM`), which override the file.
+`MSGRAPH_SENDMAIL_FROM`, `MSGRAPH_SENDMAIL_LOCAL_RECIPIENT`,
+`MSGRAPH_SENDMAIL_ALIASES_FILE`, `MSGRAPH_SENDMAIL_MAX_TIME`), which
+override the file.
 Full reference: [docs/configuration.md](docs/configuration.md).
 
-### 3. Send a test message
+### 3. Check where local mail goes, then send a test message
 
 ```sh
+msgraph-sendmail -bv root www-data      # nothing is sent
 msgraph-sendmail --to you@example.com --subject "Graph test" \
                  --body "Hello from msgraph-sendmail"
 ```
@@ -153,10 +161,40 @@ df -h | msgraph-sendmail --to admin@example.com --subject "Disk usage"
 ### Which mailbox does it send from?
 
 Precedence: `-f`/`--from` → the message's `From:` header → `from` in the
-config file. The mailbox must exist in your tenant; with the plain
+config file. Local addresses such as cron's `From: root (Cron Daemon)` or
+`-f www-data` are never used as the sender — such mail goes out from
+`from`. The mailbox must exist in your tenant; with the plain
 `Mail.Send` application permission the app may send as **any** mailbox, so
 consider an
 [application access policy](docs/azure-setup.md#restrict-the-app-to-specific-mailboxes-recommended).
+
+### Mail for root and other local users
+
+System daemons write to `root`, cron to the job's owner, scripts to
+`user@localhost` — addresses Exchange Online knows nothing about.
+msgraph-sendmail resolves them like an MTA: the `[aliases]` section of the
+config, then `/etc/aliases`, then the catch-all `local_recipient`:
+
+```ini
+[msgraph]
+local_recipient = ops@contoso.com
+
+[aliases]
+www-data = webdev@contoso.com
+```
+
+A local address that resolves to nothing fails with exit code 67 rather
+than vanishing. Details: [docs/configuration.md](docs/configuration.md#local-addresses).
+
+### Time limits
+
+The whole run — reading the message, getting a token, every retry and
+pause — stays within `max_time` (default 50 s), so it fits the budget
+that cron jobs, systemd units or backup hooks give sendmail. Set it a few
+seconds below your callers' limit. On expiry, or if the caller kills it
+with SIGTERM, the tool exits 75 and leaves a syslog line saying where it
+stopped. Details:
+[docs/configuration.md](docs/configuration.md#time-limits-and-retries).
 
 ## Exit codes
 
@@ -167,8 +205,9 @@ Standard BSD `sysexits(3)`, so cron and MTAs interpret failures correctly:
 | 0 | Message accepted by Microsoft Graph |
 | 64 | Command-line usage error |
 | 65 | Message invalid (unparseable, no recipients, too large, rejected) |
+| 67 | Local recipient (e.g. `root`) with no alias and no `local_recipient` |
 | 69 | Service refused (authentication, missing permission, unknown mailbox) |
-| 75 | Temporary failure — worth retrying (network, throttling, 5xx) |
+| 75 | Temporary failure — worth retrying (network, throttling, 5xx, `max_time` reached, killed by a signal) |
 | 78 | Configuration missing or broken |
 
 Errors are also logged to syslog (`mail` facility) so they surface in
@@ -182,9 +221,14 @@ Errors are also logged to syslog (`mail` facility) so they surface in
   implement. It fails fast with a clear message instead.
 - The sending mailbox must be licensed (or be a shared mailbox).
 - This is a *submission* tool, not a queueing MTA: if Graph is unreachable
-  it retries a few times and then exits 75. Callers that need guaranteed
-  delivery should queue on their side (cron mails, for example, are simply
-  re-sent on the next run).
+  it retries within `max_time` and then exits 75. Callers that need
+  guaranteed delivery should retry on their side (e.g. `Restart=on-failure`
+  on the systemd unit that sends an alert).
+- A retry after a lost response may deliver a message twice; this is
+  preferred over losing it and is logged.
+- Applications inside containers can't use the host's
+  `/usr/sbin/sendmail`; install msgraph-sendmail (and its config) in the
+  container image.
 
 ## Development
 

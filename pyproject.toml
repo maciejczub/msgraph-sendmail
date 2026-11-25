@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "msgraph-sendmail"
-version = "1.0.0"
+version = "1.1.0"
 description = "Drop-in sendmail replacement that delivers mail through the Microsoft Graph API"
 readme = "README.md"
 requires-python = ">=3.8"
