@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Documentation
+- New "Containers" section in the system integration guide: Dockerfile
+  recipes for Debian- and Alpine-based images (`python3`, not
+  `python3-minimal`), config and secret via Compose, PHP-FPM's
+  `clear_env`, the secret's exposure and timeouts in web requests.
+
 ## [1.1.0] - 2026-11-25
 
 ### Upgrading from 1.0
@@ -98,5 +106,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   configuration reference, system integration guide (symlink,
   update-alternatives, PHP, cron, postfix bridge), man page.
 
+[Unreleased]: https://github.com/maciejczub/msgraph-sendmail/compare/v1.1.0...HEAD
 [1.1.0]: https://github.com/maciejczub/msgraph-sendmail/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/maciejczub/msgraph-sendmail/releases/tag/v1.0.0

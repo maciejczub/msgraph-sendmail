@@ -96,6 +96,118 @@ default_transport = graph
 (That said, if you control the application, calling msgraph-sendmail
 directly is simpler and has fewer moving parts.)
 
+## Containers (Docker, Compose, Kubernetes)
+
+An application in a container doesn't see the host's `/usr/sbin/sendmail`,
+and images such as the official `php:*` ones ship no sendmail at all —
+PHP's `mail()` simply fails there. Put msgraph-sendmail into the image:
+it is one file plus a Python interpreter.
+
+### Dockerfile
+
+Debian-based images (`php:*-apache`, `php:*-fpm`, `php:*-cli`, …):
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM php:8.4-apache
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+ADD --checksum=sha256:a3869d6840f0a45ed231636450b5f491b84ddc59ceb3ec35c50a96a220acd18f \
+    --chmod=755 \
+    https://github.com/maciejczub/msgraph-sendmail/releases/download/v1.1.0/msgraph_sendmail.py \
+    /usr/local/bin/msgraph-sendmail
+RUN ln -sf /usr/local/bin/msgraph-sendmail /usr/sbin/sendmail
+```
+
+Alpine-based images (`php:*-alpine`): replace the `apt-get` line with
+`RUN apk add --no-cache python3`.
+
+- Install `python3`, **not** `python3-minimal`: the minimal Debian package
+  lacks modules msgraph-sendmail needs (`http`, among others). Python adds
+  about 35 MB to a Debian image and 40 MB to an Alpine one.
+- The checksum pins the exact release file; it is listed in the release
+  notes. When upgrading, change the version in the URL and the checksum
+  together.
+- PHP's default `sendmail_path` (`/usr/sbin/sendmail -t -i`) then works
+  unchanged — no `php.ini` edits.
+
+### Configuration and the secret
+
+Keep both out of the image and mount them at runtime. A config file works
+with every PHP setup:
+
+```yaml
+# compose.yaml
+services:
+  app:
+    build: .
+    volumes:
+      - ./msgraph-sendmail.conf:/etc/msgraph-sendmail.conf:ro
+    secrets:
+      - graph_client_secret
+
+secrets:
+  graph_client_secret:
+    file: ./secrets/graph_client_secret   # contains only the secret value
+```
+
+```ini
+# msgraph-sendmail.conf — no secret in here
+[msgraph]
+tenant = contoso.com
+client_id = 00000000-0000-0000-0000-000000000000
+client_secret_file = /run/secrets/graph_client_secret
+from = noreply@contoso.com
+local_recipient = ops@contoso.com
+max_time = 20
+```
+
+- Both files must be readable by the user PHP runs as **inside** the
+  container (`www-data`: uid/gid 33 in Debian-based images, 82 in Alpine
+  ones). Plain Compose mounts secrets as files with their host owner and
+  mode, so e.g. `chgrp 33 secrets/graph_client_secret && chmod 640
+  secrets/graph_client_secret`. In Kubernetes, mount a Secret volume and
+  set `defaultMode` / `fsGroup` accordingly.
+- The `MSGRAPH_SENDMAIL_*` environment variables work as well, but
+  PHP-FPM clears its workers' environment by default (`clear_env = yes`),
+  so the sendmail process started by `mail()` would not see them. The
+  config file avoids that pitfall.
+- Check the result from inside the container (nothing is sent):
+  `docker compose exec app sendmail -bv root www-data`.
+
+### The application can read the secret
+
+Whatever runs as the web server user can read the client secret — just
+as it could read SMTP credentials in any application's config. With the
+plain `Mail.Send` application permission that secret can send as **any**
+mailbox in the tenant, so restrict the app registration to the one
+sending mailbox with an
+[application access policy](azure-setup.md#restrict-the-app-to-specific-mailboxes-recommended).
+A leaked secret can then only send as that mailbox.
+
+### Time budget and logs
+
+- `mail()` blocks the web request until msgraph-sendmail exits. Keep
+  `max_time` well below your web server's and proxy's timeouts (15–25 s is
+  a reasonable range); it is also the longest a page can hang on mail.
+- `mail()` returns `false` whenever msgraph-sendmail exits non-zero.
+- Most containers have no syslog daemon. Error messages still go to
+  stderr, which PHP passes on to the web server's error log — in the
+  official images that ends up in `docker logs`.
+
+### Why there is no host-side bridge
+
+Keeping the secret on the host — a socket-activated service on the host
+that containers hand their mail to — was considered and set aside
+([#3](https://github.com/maciejczub/msgraph-sendmail/issues/3)).
+It only fits one deployment shape (Docker on a systemd host, with access
+to the compose file), adds a local mail relay that has to be secured and
+maintained, and an application access policy already limits what a leaked
+secret can do.
+
 ## Things to know
 
 - **No queue.** If Graph is down, the tool retries within its time budget

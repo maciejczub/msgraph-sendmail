@@ -227,8 +227,9 @@ Errors are also logged to syslog (`mail` facility) so they surface in
 - A retry after a lost response may deliver a message twice; this is
   preferred over losing it and is logged.
 - Applications inside containers can't use the host's
-  `/usr/sbin/sendmail`; install msgraph-sendmail (and its config) in the
-  container image.
+  `/usr/sbin/sendmail`; add msgraph-sendmail to the image instead — see
+  [Containers](docs/sendmail-integration.md#containers-docker-compose-kubernetes)
+  for a Dockerfile and Compose example.
 
 ## Development
 
