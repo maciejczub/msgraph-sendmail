@@ -24,7 +24,10 @@ HTTPS via Graph.
 - Local addresses handled like an MTA: mail to `root`, cron job owners or
   `www-data@thishost` is mapped via `[aliases]`, `/etc/aliases` and a
   catch-all `local_recipient`; check it with `-bv`
-- Automatic retry with backoff on throttling (HTTP 429) and server errors
+- Automatic retry with backoff on throttling (HTTP 429), server and
+  network errors — all within an overall time budget (`max_time`), so
+  callers with a timeout get a clean exit 75 and a syslog entry instead of
+  being killed mid-send
 - Meaningful `sysexits` exit codes and syslog logging (mail facility)
 
 ## Installation
@@ -143,6 +146,7 @@ df -h | msgraph-sendmail --to admin@example.com --subject "Disk usage"
 | `--from ADDR` / `-f ADDR` | Sender mailbox (overrides `From:` header and config) |
 | `--config FILE` | Use an alternate config file |
 | `--save-to-sent` / `--no-save-to-sent` | Keep a copy in Sent Items (default: keep) |
+| `--max-time SECONDS` | Give up (exit 75) after this long in total, retries included; default 50, `0` = no limit |
 | `--dry-run` | Print the Graph API payload instead of sending |
 | `--verbose` | Debug output on stderr |
 

@@ -334,6 +334,9 @@ class _FakeResponse:
     def read(self):
         return self._body
 
+    def close(self):
+        pass
+
     def __enter__(self):
         return self
 
@@ -350,7 +353,7 @@ class TestHttp(unittest.TestCase):
         return cfg
 
     def test_send_success(self):
-        with mock.patch.object(m.urllib.request, "urlopen",
+        with mock.patch.object(m, "_open",
                                return_value=_FakeResponse(202, b"")):
             m.send_message(self._cfg(), "tok", "s@x.example",
                            {"subject": "t", "toRecipients": []}, True)
@@ -362,7 +365,7 @@ class TestHttp(unittest.TestCase):
                           {"Retry-After": "0"}),
             _FakeResponse(202, b""),
         ]
-        with mock.patch.object(m.urllib.request, "urlopen",
+        with mock.patch.object(m, "_open",
                                side_effect=responses), \
              mock.patch.object(m.time, "sleep") as sleep:
             m.send_message(self._cfg(), "tok", "s@x.example",
@@ -373,7 +376,7 @@ class TestHttp(unittest.TestCase):
         response = _FakeResponse(
             400, b'{"error":{"code":"ErrorInvalidRecipients",'
                  b'"message":"bad recipient"}}')
-        with mock.patch.object(m.urllib.request, "urlopen",
+        with mock.patch.object(m, "_open",
                                return_value=response):
             with self.assertRaises(m.UserError) as ctx:
                 m.send_message(self._cfg(), "tok", "s@x.example",
@@ -384,7 +387,7 @@ class TestHttp(unittest.TestCase):
         response = _FakeResponse(
             403, b'{"error":{"code":"ErrorAccessDenied",'
                  b'"message":"denied"}}')
-        with mock.patch.object(m.urllib.request, "urlopen",
+        with mock.patch.object(m, "_open",
                                return_value=response):
             with self.assertRaises(m.UserError) as ctx:
                 m.send_message(self._cfg(), "tok", "s@x.example",
@@ -402,7 +405,7 @@ class TestHttp(unittest.TestCase):
         response = _FakeResponse(
             401, json.dumps({"error": "invalid_client",
                              "error_description": "AADSTS7000215"}).encode())
-        with mock.patch.object(m.urllib.request, "urlopen",
+        with mock.patch.object(m, "_open",
                                return_value=response):
             with self.assertRaises(m.UserError) as ctx:
                 m.get_token(self._cfg())
@@ -1137,6 +1140,796 @@ class TestReviewRound3(unittest.TestCase):
         code, out = self._run_noop(["-bp"])
         self.assertEqual(code, m.EX_OK)
         self.assertIn("queue is empty", out)
+
+
+
+# ---------------------------------------------------------------------------
+# Delivery time budget (issue #2)
+# ---------------------------------------------------------------------------
+
+class FakeClock:
+    """Monotonic clock + sleep that only advance when told to."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _net_cfg(**kwargs):
+    cfg = m.Config()
+    cfg.tenant, cfg.client_id, cfg.client_secret = "t", "c", "s"
+    for key, value in kwargs.items():
+        setattr(cfg, key, value)
+    return cfg
+
+
+class FakeHttp:
+    """Stand-in for _http_request: each step is (duration, result) where
+    result is a (status, body, headers) tuple or an exception to raise."""
+
+    def __init__(self, clock, steps):
+        self.clock = clock
+        self.steps = list(steps)
+        self.timeouts = []
+
+    def __call__(self, url, data, headers, timeout, on_accepted=None):
+        self.timeouts.append(timeout)
+        duration, result = self.steps.pop(0)
+        self.clock.now += min(duration, timeout)
+        if duration > timeout:
+            raise m.NetworkError("timed out", maybe_sent=True)
+        if isinstance(result, BaseException):
+            raise result
+        if result[0] == 202 and on_accepted is not None:
+            on_accepted()
+        return result
+
+
+ACCEPTED = (202, b"", {})
+TOKEN_OK = (200, b'{"access_token": "tok"}', {})
+
+
+def _busy(retry_after=None):
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    return (503, b'{"error":{"code":"ServiceUnavailable","message":"busy"}}',
+            headers)
+
+
+class TestDeadline(unittest.TestCase):
+    def test_remaining_and_elapsed(self):
+        clock = FakeClock()
+        d = m.Deadline(50, clock=clock)
+        clock.now += 20
+        self.assertAlmostEqual(d.remaining(), 30)
+        self.assertAlmostEqual(d.elapsed(), 20)
+
+    def test_zero_means_unlimited(self):
+        d = m.Deadline(0, clock=FakeClock())
+        self.assertEqual(d.remaining(), float("inf"))
+
+
+class TestRetryAfter(unittest.TestCase):
+    def test_seconds(self):
+        self.assertEqual(m._parse_retry_after("7"), 7.0)
+
+    def test_http_date(self):
+        now = 1_700_000_000.0
+        value = email.utils.formatdate(now + 12, usegmt=True)
+        self.assertAlmostEqual(m._parse_retry_after(value, now=now), 12,
+                               delta=1)
+
+    def test_garbage_and_negative(self):
+        self.assertIsNone(m._parse_retry_after("soon"))
+        self.assertEqual(m._parse_retry_after("-5"), 0.0)
+
+
+class TestSendBudget(unittest.TestCase):
+    def _send(self, steps, cfg=None, max_time=50):
+        clock = FakeClock()
+        http = FakeHttp(clock, steps)
+        deadline = m.Deadline(max_time, clock=clock)
+        with mock.patch.object(m, "_http_request", http), \
+             mock.patch.object(m.time, "sleep", clock.sleep), \
+             mock.patch.object(m, "_syslog_write") as syslog:
+            try:
+                m.send_message(cfg or _net_cfg(), "tok", "s@x.example",
+                               {"subject": "t"}, True, deadline=deadline)
+                error = None
+            except m.UserError as exc:
+                error = exc
+        return error, clock, http, syslog
+
+    def test_5xx_retried_then_accepted(self):
+        error, clock, http, syslog = self._send([(1, _busy()), (1, ACCEPTED)])
+        self.assertIsNone(error)
+        self.assertEqual(clock.sleeps, [2.0])
+        self.assertTrue(syslog.called)  # the retry is logged
+
+    def test_retry_after_honoured_when_short(self):
+        error, clock, _, _ = self._send([(1, _busy("10")), (1, ACCEPTED)])
+        self.assertIsNone(error)
+        self.assertEqual(clock.sleeps, [10.0])
+
+    def test_long_retry_after_gives_up_immediately(self):
+        error, clock, http, _ = self._send([(1, _busy("120"))])
+        self.assertEqual(error.exit_code, m.EX_TEMPFAIL)
+        self.assertEqual(clock.sleeps, [])
+        self.assertEqual(http.steps, [])
+        self.assertIn("Retry-After", str(error))
+
+    def test_retry_after_beyond_deadline_gives_up(self):
+        error, clock, _, _ = self._send([(1, _busy("20"))], max_time=15)
+        self.assertEqual(error.exit_code, m.EX_TEMPFAIL)
+        self.assertEqual(clock.sleeps, [])
+
+    def test_slow_server_stays_within_max_time(self):
+        steps = [(60, None)] * 10
+        error, clock, http, _ = self._send(steps, _net_cfg(timeout=15))
+        self.assertEqual(error.exit_code, m.EX_TEMPFAIL)
+        self.assertLessEqual(clock.now - 1000.0, 50.0 + 1e-6)
+        self.assertTrue(all(t <= 15 for t in http.timeouts))
+        self.assertIn("max_time", str(error))
+
+    def test_socket_timeout_capped_by_remaining_budget(self):
+        error, clock, http, _ = self._send(
+            [(1, _busy()), (1, ACCEPTED)], _net_cfg(timeout=15), max_time=5)
+        self.assertIsNone(error)
+        self.assertEqual(http.timeouts[0], 5)
+        self.assertLessEqual(http.timeouts[1], 2.0)
+
+    def test_network_error_before_send_is_retried(self):
+        error, clock, http, syslog = self._send([
+            (0, m.NetworkError("connection refused", maybe_sent=False)),
+            (1, ACCEPTED)])
+        self.assertIsNone(error)
+        self.assertEqual(clock.sleeps, [2.0])
+
+    def test_network_error_after_send_retried_with_duplicate_warning(self):
+        error, clock, http, syslog = self._send([
+            (0, m.NetworkError("connection reset", maybe_sent=True)),
+            (1, ACCEPTED)])
+        self.assertIsNone(error)
+        logged = " ".join(str(c) for c in syslog.call_args_list)
+        self.assertIn("twice", logged)
+
+    def test_non_retryable_network_error_fails_at_once(self):
+        error, clock, http, _ = self._send([
+            (0, m.NetworkError("certificate verify failed", maybe_sent=False,
+                               retryable=False)),
+            (1, ACCEPTED)])
+        self.assertEqual(error.exit_code, m.EX_TEMPFAIL)
+        self.assertEqual(len(http.steps), 1)
+
+    def test_network_errors_exhaust_attempts(self):
+        steps = [(0, m.NetworkError("refused", maybe_sent=False))] * 4
+        error, clock, http, _ = self._send(steps, max_time=0)
+        self.assertEqual(error.exit_code, m.EX_TEMPFAIL)
+        self.assertEqual(http.steps, [])
+        self.assertIn("refused", str(error))
+
+    def test_permanent_error_not_retried(self):
+        error, clock, http, _ = self._send([
+            (0, (400, b'{"error":{"code":"ErrorInvalidRecipients",'
+                      b'"message":"bad"}}', {})), (0, ACCEPTED)])
+        self.assertEqual(error.exit_code, m.EX_DATAERR)
+        self.assertEqual(len(http.steps), 1)
+
+
+class TestTokenBudget(unittest.TestCase):
+    def _token(self, steps, max_time=50):
+        clock = FakeClock()
+        http = FakeHttp(clock, steps)
+        with mock.patch.object(m, "_http_request", http), \
+             mock.patch.object(m.time, "sleep", clock.sleep), \
+             mock.patch.object(m, "_syslog_write"):
+            try:
+                return m.get_token(_net_cfg(),
+                                   deadline=m.Deadline(max_time, clock=clock)), \
+                    None, http
+            except m.UserError as exc:
+                return None, exc, http
+
+    def test_token_5xx_retried(self):
+        token, error, _ = self._token([(1, _busy()), (1, TOKEN_OK)])
+        self.assertEqual(token, "tok")
+
+    def test_token_network_error_retried(self):
+        token, error, _ = self._token([
+            (0, m.NetworkError("dns failure", maybe_sent=False)),
+            (1, TOKEN_OK)])
+        self.assertEqual(token, "tok")
+
+    def test_token_auth_error_not_retried(self):
+        token, error, http = self._token([
+            (0, (401, b'{"error":"invalid_client",'
+                      b'"error_description":"AADSTS7000215"}', {})),
+            (0, TOKEN_OK)])
+        self.assertEqual(error.exit_code, m.EX_UNAVAILABLE)
+        self.assertEqual(len(http.steps), 1)
+
+
+class TestHttpErrorClassification(unittest.TestCase):
+    def _classify(self, exc):
+        with mock.patch.object(m, "_open", side_effect=exc):
+            with self.assertRaises(m.NetworkError) as ctx:
+                m._http_request("https://x.example/", b"", {}, 5)
+        return ctx.exception
+
+    def test_connect_failure_was_not_sent(self):
+        err = self._classify(m.urllib.error.URLError(ConnectionRefusedError()))
+        self.assertFalse(err.maybe_sent)
+        self.assertTrue(err.retryable)
+
+    def test_response_timeout_may_have_been_sent(self):
+        err = self._classify(TimeoutError("timed out"))
+        self.assertTrue(err.maybe_sent)
+        self.assertTrue(err.retryable)
+
+    def test_incomplete_read_may_have_been_sent(self):
+        import http.client
+        err = self._classify(http.client.IncompleteRead(b""))
+        self.assertTrue(err.maybe_sent)
+
+    def test_certificate_failure_not_retryable(self):
+        import ssl
+        err = self._classify(m.urllib.error.URLError(
+            ssl.SSLCertVerificationError("bad cert")))
+        self.assertFalse(err.retryable)
+
+
+class TestBudgetConfig(unittest.TestCase):
+    def _conf(self, text):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".conf",
+                                         delete=False) as fh:
+            fh.write(text)
+        os.chmod(fh.name, 0o600)
+        self.addCleanup(os.unlink, fh.name)
+        return fh.name
+
+    def test_defaults(self):
+        cfg = m.Config()
+        self.assertEqual(cfg.timeout, 15.0)
+        self.assertEqual(cfg.max_time, 50.0)
+
+    def test_file_and_env(self):
+        path = self._conf("[msgraph]\nmax_time = 40\n")
+        self.assertEqual(m.load_config(path).max_time, 40.0)
+        with mock.patch.dict(os.environ, {"MSGRAPH_SENDMAIL_MAX_TIME": "25"}):
+            self.assertEqual(m.load_config(path).max_time, 25.0)
+
+    def test_invalid_max_time(self):
+        for bad in ("-1", "soon"):
+            with self.assertRaises(m.UserError) as ctx:
+                m.load_config(self._conf(f"[msgraph]\nmax_time = {bad}\n"))
+            self.assertEqual(ctx.exception.exit_code, m.EX_CONFIG)
+
+    def test_cli_option(self):
+        self.assertEqual(m.parse_args(["--max-time", "30", "a@x.example"])
+                         .max_time, 30.0)
+        self.assertEqual(m.parse_args(["--max-time=0", "a@x.example"])
+                         .max_time, 0.0)
+        with self.assertRaises(m.UserError) as ctx:
+            m.parse_args(["--max-time", "x", "a@x.example"])
+        self.assertEqual(ctx.exception.exit_code, m.EX_USAGE)
+
+    def test_cli_option_does_not_switch_to_cli_mode(self):
+        self.assertEqual(m.parse_args(["--max-time", "30", "-t"]).mode,
+                         "sendmail")
+
+
+def _reset_abort_state():
+    m._ABORTING = m._FINISHING = m._REPORTING = False
+    m._PENDING_ABORT = None
+    m._PROGRESS.clear()
+    m._PROGRESS.update(stage="startup", attempt=0)
+
+
+class TestAbortLogging(unittest.TestCase):
+    def setUp(self):
+        _reset_abort_state()
+        self.addCleanup(_reset_abort_state)
+
+    def test_sigterm_is_logged_and_exits_tempfail(self):
+        import signal as _signal
+
+        def fake_run(argv):
+            m._PROGRESS.update(stage="send", attempt=2)
+            m._on_signal(_signal.SIGTERM, None)
+
+        with mock.patch.object(m, "run", fake_run), \
+             mock.patch.object(m, "_syslog_write") as syslog, \
+             mock.patch.object(m.sys, "stderr", io.StringIO()), \
+             mock.patch.object(m, "_install_signal_handlers"):
+            with self.assertRaises(SystemExit) as ctx:
+                m.main()
+        self.assertEqual(ctx.exception.code, m.EX_TEMPFAIL)
+        logged = " ".join(str(c) for c in syslog.call_args_list)
+        self.assertIn("SIGTERM", logged)
+        self.assertIn("stage: send", logged)
+        self.assertIn("attempt 2", logged)
+
+    def test_give_up_is_logged_to_syslog(self):
+        def fake_run(argv):
+            raise m.UserError("gave up", m.EX_TEMPFAIL)
+
+        with mock.patch.object(m, "run", fake_run), \
+             mock.patch.object(m, "_syslog_write") as syslog, \
+             mock.patch.object(m.sys, "stderr", io.StringIO()), \
+             mock.patch.object(m, "_install_signal_handlers"):
+            with self.assertRaises(SystemExit) as ctx:
+                m.main()
+        self.assertEqual(ctx.exception.code, m.EX_TEMPFAIL)
+        self.assertTrue(syslog.called)
+
+
+class SlowServer:
+    """A local HTTP server that is slow on purpose.
+
+    mode "silent": accept the request, then say nothing for *delay* s.
+    mode "trickle": send headers, then one body byte every 0.3 s for
+    *delay* s — every socket read succeeds, so only an overall deadline
+    (not a socket timeout) can stop the client.
+    """
+
+    def __init__(self, delay, mode="silent"):
+        import http.server
+        import threading
+        self.hit = threading.Event()
+        self.stop = threading.Event()
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                outer.hit.set()
+                try:
+                    if mode == "trickle":
+                        self.send_response(200)
+                        self.send_header("Content-Length", "100000")
+                        self.end_headers()
+                        self.wfile.flush()
+                        end = time.monotonic() + delay
+                        while time.monotonic() < end \
+                                and not outer.stop.wait(0.3):
+                            self.wfile.write(b" ")
+                            self.wfile.flush()
+                    else:
+                        outer.stop.wait(delay)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0),
+                                                      Handler)
+        self.server.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        self.server.shutdown()
+        self.server.server_close()
+
+
+import time  # noqa: E402  (used by SlowServer)
+
+
+class TestBudgetIntegration(unittest.TestCase):
+    """Real processes against a real (slow) local HTTP server."""
+
+    ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+
+    def _spawn(self, server, extra_args, cli=True, stdin=None,
+               block_sigalrm=False):
+        import subprocess
+        code = ("import os, signal, sys; sys.path.insert(0, sys.argv[1]); "
+                "os.environ.get('TEST_BLOCK_SIGALRM') and "
+                "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM}); "
+                "import msgraph_sendmail as m; "
+                "m.LOGIN_BASE = sys.argv[2]; m.GRAPH_BASE = sys.argv[2]; "
+                "sys.argv = ['msgraph-sendmail'] + sys.argv[3:]; m.main()")
+        # Allowlisted environment: never pass the developer's real
+        # MSGRAPH_SENDMAIL_* settings (e.g. CLIENT_SECRET_FILE) or proxy
+        # variables to a child that talks plain HTTP.
+        env = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL")
+               if key in os.environ}
+        env.update(MSGRAPH_SENDMAIL_CONFIG=os.devnull,
+                   MSGRAPH_SENDMAIL_TENANT="t",
+                   MSGRAPH_SENDMAIL_CLIENT_ID="c",
+                   MSGRAPH_SENDMAIL_CLIENT_SECRET="dummy-secret",
+                   MSGRAPH_SENDMAIL_FROM="s@x.example",
+                   NO_PROXY="*", no_proxy="*")
+        if block_sigalrm:
+            env["TEST_BLOCK_SIGALRM"] = "1"
+        args = (["--to", "a@x.example", "--body", "x"] if cli
+                else ["a@x.example"])
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code, self.ROOT, server.url]
+            + args + extra_args,
+            env=env, stdin=stdin if stdin is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        def reap():
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
+        self.addCleanup(reap)
+        return proc
+
+    def test_hard_deadline_against_silent_server(self):
+        server = SlowServer(delay=30)
+        self.addCleanup(server.close)
+        start = time.monotonic()
+        proc = self._spawn(server, ["--max-time", "2"])
+        _, stderr = proc.communicate(timeout=20)
+        elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, m.EX_TEMPFAIL, stderr)
+        self.assertLess(elapsed, 6)
+        self.assertIn("max_time", stderr)
+
+    def test_hard_deadline_against_trickling_server(self):
+        # Each read succeeds within the socket timeout; only the real-time
+        # timer can stop this.
+        server = SlowServer(delay=30, mode="trickle")
+        self.addCleanup(server.close)
+        start = time.monotonic()
+        proc = self._spawn(server, ["--max-time", "2"])
+        _, stderr = proc.communicate(timeout=20)
+        elapsed = time.monotonic() - start
+        self.assertEqual(proc.returncode, m.EX_TEMPFAIL, stderr)
+        self.assertLess(elapsed, 6)
+        self.assertIn("max_time of 2s exceeded", stderr)
+        self.assertIn("stage: token", stderr)
+
+    def test_closed_stderr_keeps_exit_status(self):
+        server = SlowServer(delay=30)
+        self.addCleanup(server.close)
+        proc = self._spawn(server, ["--max-time", "1"])
+        proc.stderr.close()               # caller stopped reading stderr
+        proc.wait(timeout=15)
+        self.assertEqual(proc.returncode, m.EX_TEMPFAIL)
+
+    def test_inherited_blocked_sigalrm_does_not_disable_deadline(self):
+        import subprocess
+        server = SlowServer(delay=30)
+        self.addCleanup(server.close)
+        start = time.monotonic()
+        proc = self._spawn(server, ["--max-time", "2"], cli=False,
+                           stdin=subprocess.PIPE, block_sigalrm=True)
+        try:
+            proc.wait(timeout=10)
+        finally:
+            proc.stdin.close()
+        self.assertEqual(proc.returncode, m.EX_TEMPFAIL)
+        self.assertLess(time.monotonic() - start, 6)
+
+    def test_deadline_covers_reading_stdin(self):
+        import subprocess
+        server = SlowServer(delay=30)
+        self.addCleanup(server.close)
+        start = time.monotonic()
+        proc = self._spawn(server, ["--max-time", "2"], cli=False,
+                           stdin=subprocess.PIPE)  # never written/closed
+        try:
+            proc.wait(timeout=10)
+        finally:
+            proc.stdin.close()
+        stderr = proc.stderr.read()
+        self.assertEqual(proc.returncode, m.EX_TEMPFAIL, stderr)
+        self.assertLess(time.monotonic() - start, 6)
+        self.assertIn("stage: input", stderr)
+        self.assertFalse(server.hit.is_set())
+
+    def test_sigterm_during_send_is_reported(self):
+        import signal as _signal
+        server = SlowServer(delay=30)
+        self.addCleanup(server.close)
+        proc = self._spawn(server, ["--max-time", "20"])
+        self.assertTrue(server.hit.wait(10), "request never arrived")
+        proc.send_signal(_signal.SIGTERM)
+        _, stderr = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, m.EX_TEMPFAIL, stderr)
+        self.assertIn("aborted by SIGTERM", stderr)
+        self.assertIn("stage: token", stderr)
+
+
+
+class TestBudgetReviewFindings(unittest.TestCase):
+    """Regression tests for the Codex review of #2."""
+
+    def setUp(self):
+        _reset_abort_state()
+        self.addCleanup(_reset_abort_state)
+
+    def test_accepted_202_with_broken_body_is_not_retried(self):
+        import http.client
+
+        class Broken(_FakeResponse):
+            def read(self):
+                raise http.client.IncompleteRead(b"")
+
+        with mock.patch.object(m, "_open", return_value=Broken(202, b"")):
+            status, body, _ = m._http_request("https://x.example/", b"",
+                                              {}, 5)
+        self.assertEqual(status, 202)
+
+    def test_oauth_style_error_body_is_retried_not_crashing(self):
+        clock = FakeClock()
+        http_ = FakeHttp(clock, [
+            (1, (503, b'{"error": "temporarily_unavailable"}', {})),
+            (1, TOKEN_OK)])
+        with mock.patch.object(m, "_http_request", http_), \
+             mock.patch.object(m.time, "sleep", clock.sleep), \
+             mock.patch.object(m, "_syslog_write"):
+            token = m.get_token(_net_cfg(),
+                                deadline=m.Deadline(50, clock=clock))
+        self.assertEqual(token, "tok")
+
+    def test_error_details_tolerate_odd_bodies(self):
+        self.assertEqual(m._graph_error_details(b'["x"]'), ("", ""))
+        self.assertEqual(
+            m._graph_error_details(b'{"error": "invalid_client", '
+                                   b'"error_description": "bad"}'),
+            ("invalid_client", "bad"))
+
+    def _http_error(self, code, headers, body_reads):
+        import http.client
+        msg = http.client.HTTPMessage()
+        for key, value in headers.items():
+            msg[key] = value
+
+        class Body(io.BytesIO):
+            def read(self_inner, *args):
+                body_reads.append(1)
+                return b'{"error": "x", "error_description": "AADSTS42"}'
+        return m.urllib.error.HTTPError("https://x.example/", code, "err",
+                                        msg, Body())
+
+    def test_lowercase_retry_after_header_is_honoured(self):
+        reads = []
+        exc = self._http_error(503, {"retry-after": "120"}, reads)
+        with mock.patch.object(m, "_open", side_effect=exc), \
+             mock.patch.object(m.time, "sleep") as sleep, \
+             mock.patch.object(m, "_syslog_write"):
+            with self.assertRaises(m.UserError) as ctx:
+                m.send_message(_net_cfg(), "tok", "s@x.example",
+                               {"subject": "t"}, True)
+        self.assertEqual(ctx.exception.exit_code, m.EX_TEMPFAIL)
+        sleep.assert_not_called()
+        self.assertEqual(reads, [])          # stalled body never read
+        self.assertTrue(exc.fp.closed)
+
+    def test_retry_after_ignored_for_permanent_errors(self):
+        reads = []
+        exc = self._http_error(401, {"Retry-After": "120"}, reads)
+        with mock.patch.object(m, "_open", side_effect=exc), \
+             mock.patch.object(m, "_syslog_write"):
+            with self.assertRaises(m.UserError) as ctx:
+                m.get_token(_net_cfg())
+        self.assertEqual(ctx.exception.exit_code, m.EX_UNAVAILABLE)
+        self.assertIn("AADSTS42", str(ctx.exception))
+
+    def test_overflowing_retry_after_date_is_ignored(self):
+        for value in ("Mon, 01 Jan 2024 00:00:00 +99999999",
+                      "Mon, 01 Jan 99999 00:00:00 GMT"):
+            m._parse_retry_after(value)  # must not raise
+
+    def test_accepted_marks_done_before_anything_else(self):
+        clock = FakeClock()
+        seen = []
+        with mock.patch.object(m, "_http_request",
+                               FakeHttp(clock, [(1, ACCEPTED)])), \
+             mock.patch.object(m, "debug",
+                               lambda msg: seen.append(m._PROGRESS["stage"])):
+            m.send_message(_net_cfg(), "tok", "s@x.example", {"subject": "t"},
+                           True, deadline=m.Deadline(50, clock=clock))
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {"done"})
+
+    def test_swallowed_abort_is_re_raised_before_posting(self):
+        clock = FakeClock()
+        http_ = FakeHttp(clock, [(1, ACCEPTED)])
+        m._PENDING_ABORT = "aborted by SIGTERM"
+        self.addCleanup(setattr, m, "_PENDING_ABORT", None)
+        with mock.patch.object(m, "_http_request", http_):
+            with self.assertRaises(m.Aborted):
+                m.send_message(_net_cfg(), "tok", "s@x.example",
+                               {"subject": "t"}, True,
+                               deadline=m.Deadline(50, clock=clock))
+        self.assertEqual(len(http_.steps), 1)   # nothing was posted
+
+    def test_bad_redirect_location_is_just_an_http_status(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", "http://[::1")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.handle_request, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        with mock.patch.dict(os.environ, {"NO_PROXY": "*", "no_proxy": "*"}):
+            status, _, _ = m._http_request(
+                f"http://127.0.0.1:{server.server_address[1]}/", b"x", {}, 5)
+        thread.join(5)
+        self.assertEqual(status, 302)
+
+    def test_main_restores_signal_handlers(self):
+        import signal as _signal
+        before = _signal.getsignal(_signal.SIGTERM)
+        with mock.patch.object(m, "run", return_value=0), \
+             mock.patch.object(m.sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                m.main()
+        self.assertIs(_signal.getsignal(_signal.SIGTERM), before)
+
+    def test_invalid_timing_value_not_echoed(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".conf",
+                                         delete=False) as fh:
+            fh.write("[msgraph]\ntimeout = SENTINEL-SECRET\n")
+        os.chmod(fh.name, 0o600)
+        self.addCleanup(os.unlink, fh.name)
+        with self.assertRaises(m.UserError) as ctx:
+            m.load_config(fh.name)
+        self.assertNotIn("SENTINEL", str(ctx.exception))
+
+    def test_absurd_max_time_rejected(self):
+        with self.assertRaises(m.UserError) as ctx:
+            m.parse_args(["--max-time", "1e300", "a@x.example"])
+        self.assertEqual(ctx.exception.exit_code, m.EX_USAGE)
+
+    def _main(self, fake_run, stderr=None):
+        with mock.patch.object(m, "run", fake_run), \
+             mock.patch.object(m, "_syslog_write") as syslog, \
+             mock.patch.object(m.sys, "stderr", stderr or io.StringIO()), \
+             mock.patch.object(m, "_install_signal_handlers"):
+            with self.assertRaises(SystemExit) as ctx:
+                m.main()
+        return ctx.exception.code, syslog
+
+    def test_signal_after_acceptance_exits_zero(self):
+        import signal as _signal
+
+        def fake_run(argv):
+            m._PROGRESS.update(stage="done", attempt=1)
+            m._on_signal(_signal.SIGTERM, None)
+
+        code, syslog = self._main(fake_run)
+        self.assertEqual(code, m.EX_OK)
+        self.assertIn("accepted", " ".join(map(str, syslog.call_args_list)))
+
+    def test_second_signal_is_ignored(self):
+        import signal as _signal
+        with self.assertRaises(m.Aborted):
+            m._on_signal(_signal.SIGTERM, None)
+        self.assertIsNone(m._on_signal(_signal.SIGTERM, None))
+
+    def test_signal_while_reporting_an_error_keeps_its_exit_code(self):
+        import signal as _signal
+
+        def fake_run(argv):
+            raise m.UserError("bad message", m.EX_DATAERR)
+
+        real_log_error = m.log_error
+
+        def log_error(message):
+            m._on_signal(_signal.SIGTERM, None)
+            real_log_error(message)
+
+        with mock.patch.object(m, "log_error", log_error):
+            code, _ = self._main(fake_run)
+        self.assertEqual(code, m.EX_DATAERR)
+
+    def test_broken_stderr_still_logs_to_syslog(self):
+        class BrokenPipe(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError()
+
+        def fake_run(argv):
+            raise m.UserError("gave up", m.EX_TEMPFAIL)
+
+        code, syslog = self._main(fake_run, stderr=BrokenPipe())
+        self.assertEqual(code, m.EX_TEMPFAIL)
+        self.assertTrue(syslog.called)
+
+
+
+class TestBudgetRound3(unittest.TestCase):
+    """Regression tests for the final Codex review round of #2."""
+
+    def setUp(self):
+        _reset_abort_state()
+        self.addCleanup(_reset_abort_state)
+
+    def test_202_survives_a_failing_close(self):
+        class CloseFails(_FakeResponse):
+            def close(self):
+                raise OSError("reset while closing")
+
+            def __exit__(self, *exc):
+                self.close()
+
+        accepted = []
+        with mock.patch.object(m, "_open",
+                               return_value=CloseFails(202, b"")):
+            status, _, _ = m._http_request(
+                "https://x.example/", b"", {}, 5,
+                on_accepted=lambda: accepted.append(1))
+        self.assertEqual(status, 202)
+        self.assertEqual(accepted, [1])
+
+    def test_202_marks_done_before_close(self):
+        stages = []
+
+        class Watch(_FakeResponse):
+            def close(self):
+                stages.append(m._PROGRESS.get("stage"))
+
+            def __exit__(self, *exc):
+                self.close()
+
+        with mock.patch.object(m, "_open", return_value=Watch(202, b"")):
+            m.send_message(_net_cfg(), "tok", "s@x.example",
+                           {"subject": "t"}, True)
+        self.assertEqual(stages, ["done"])
+
+    def test_swallowed_abort_stops_dry_run_before_output(self):
+        fake_stdin = mock.Mock()
+        fake_stdin.buffer = io.BytesIO(b"To: a@x.example\nSubject: s\n\nb\n")
+        stdout = io.StringIO()
+        m._PENDING_ABORT = "aborted by SIGTERM"
+        with mock.patch.object(m.sys, "stdin", fake_stdin), \
+             mock.patch.object(m.sys, "stdout", stdout), \
+             mock.patch.object(m, "load_config",
+                               return_value=_cfg(default_from="s@x.example")):
+            with self.assertRaises(m.Aborted):
+                m.run(["-t", "--dry-run"])
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_install_records_handlers_even_if_unmasking_raises(self):
+        import signal as _signal
+        before = _signal.getsignal(_signal.SIGTERM)
+        previous = {}
+        with mock.patch.object(m.signal, "pthread_sigmask",
+                               side_effect=m.Aborted("aborted by SIGTERM")):
+            with self.assertRaises(m.Aborted):
+                m._install_signal_handlers(previous)
+        self.assertIn(_signal.SIGTERM, previous)
+        m._restore_signal_handlers(previous)
+        self.assertIs(_signal.getsignal(_signal.SIGTERM), before)
+
+    def test_restore_leaves_unknown_native_handlers_alone(self):
+        import signal as _signal
+        with mock.patch.object(m.signal, "signal") as set_handler:
+            m._restore_signal_handlers({_signal.SIGTERM: None})
+        set_handler.assert_not_called()
+
+    def test_stderr_none_is_tolerated(self):
+        with mock.patch.object(m.sys, "stderr", None):
+            m._stderr("hello")  # must not raise
 
 
 if __name__ == "__main__":

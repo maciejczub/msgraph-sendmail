@@ -29,10 +29,13 @@ import configparser
 import email
 import email.policy
 import email.utils
+import http.client
 import json
+import math
 import mimetypes
 import os
 import re
+import signal
 import socket
 import ssl
 import stat
@@ -54,6 +57,14 @@ GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 # attachments would need a draft message + upload session, which this
 # tool does not implement (yet).
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
+
+# Retry policy for the token request and sendMail (issue #2).
+RETRY_ATTEMPTS = 4          # per request, including the first one
+RETRY_BASE_DELAY = 2.0      # seconds; doubled after every retry
+MAX_RETRY_AFTER = 30.0      # longest Retry-After we are willing to sleep
+DEFAULT_TIMEOUT = 15.0      # seconds, per socket operation
+DEFAULT_MAX_TIME = 50.0     # seconds, whole run (0 = no limit)
+MAX_SECONDS = 1_000_000.0   # sanity bound for timeout/max_time settings
 
 # BSD sysexits(3) — respected by cron, procmail, PHP and most MTAs.
 EX_OK = 0
@@ -84,6 +95,50 @@ class UserError(Exception):
         self.exit_code = exit_code
 
 
+class NetworkError(Exception):
+    """A request failed below HTTP.  *maybe_sent* is True when the request
+    may have reached the server (the failure happened while waiting for or
+    reading the response), so a retry could duplicate its effect."""
+
+    def __init__(self, reason: str, maybe_sent: bool,
+                 retryable: bool = True):
+        super().__init__(reason)
+        self.maybe_sent = maybe_sent
+        self.retryable = retryable
+
+
+class Aborted(BaseException):
+    """Raised from a signal handler; BaseException so that no ordinary
+    ``except Exception`` on the way up can swallow it."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class Deadline:
+    """Time budget for one run; max_time 0/None means unlimited."""
+
+    def __init__(self, max_time: float | None, clock=None,
+                 start: float | None = None) -> None:
+        self._clock = clock or time.monotonic
+        self.start = self._clock() if start is None else start
+        self.max_time = max_time or 0.0
+
+    def elapsed(self) -> float:
+        return self._clock() - self.start
+
+    def remaining(self) -> float:
+        if not self.max_time:
+            return math.inf
+        return self.max_time - self.elapsed()
+
+
+# What the run is doing right now — reported when it gets killed.
+_PROGRESS: dict = {"stage": "startup", "attempt": 0}
+_DEADLINE: Deadline | None = None
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -106,10 +161,49 @@ def _syslog_write(priority: int, message: str) -> None:
         pass
 
 
+def _stderr(text: str) -> None:
+    """Best effort: a caller that closed our stderr must not change the
+    outcome (or keep the syslog entry from being written)."""
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        print(text, file=stream)
+        stream.flush()
+    except (OSError, ValueError):
+        _silence(stream)
+
+
+def _silence(stream) -> None:
+    """Point *stream*'s descriptor at /dev/null, so that the interpreter's
+    final flush of leftover buffered output can neither fail (exit status
+    120) nor block on a full pipe."""
+    try:
+        fd = stream.fileno()
+    except (OSError, ValueError, AttributeError):
+        return
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(devnull, fd)
+    except OSError:
+        pass
+    finally:
+        os.close(devnull)
+
+
 def log_error(message: str) -> None:
-    print(f"{PROG}: error: {message}", file=sys.stderr)
     if _syslog is not None:
         _syslog_write(_syslog.LOG_ERR, message)
+    _stderr(f"{PROG}: error: {message}")
+
+
+def log_warning(message: str) -> None:
+    debug(message)
+    if _syslog is not None:
+        _syslog_write(_syslog.LOG_WARNING, message)
 
 
 def log_info(message: str) -> None:
@@ -119,7 +213,7 @@ def log_info(message: str) -> None:
 
 def debug(message: str) -> None:
     if _VERBOSE:
-        print(f"{PROG}: {message}", file=sys.stderr)
+        _stderr(f"{PROG}: {message}")
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +227,8 @@ class Config:
         self.client_secret: str | None = None
         self.default_from: str | None = None
         self.save_to_sent: bool = True
-        self.timeout: float = 30.0
+        self.timeout: float = DEFAULT_TIMEOUT       # per socket operation
+        self.max_time: float = DEFAULT_MAX_TIME     # whole run, 0 = no limit
         self.source: str | None = None  # where the config came from
         # Local address handling (see AddressResolver).
         self.local_recipient: str | None = None
@@ -208,10 +303,10 @@ def _apply_config_section(parser: configparser.ConfigParser,
             raise UserError(
                 f"invalid boolean for save_to_sent in {path}", EX_CONFIG)
     if "timeout" in section:
-        try:
-            cfg.timeout = float(section["timeout"])
-        except ValueError:
-            raise UserError(f"invalid timeout in {path}", EX_CONFIG)
+        cfg.timeout = _seconds(section["timeout"], "timeout", EX_CONFIG,
+                               allow_zero=False)
+    if "max_time" in section:
+        cfg.max_time = _seconds(section["max_time"], "max_time", EX_CONFIG)
     if "local_recipient" in section:
         cfg.local_recipient = section["local_recipient"].strip() or None
     if "aliases_file" in section:
@@ -276,11 +371,32 @@ def load_config(explicit_path: str | None) -> Config:
     cfg.local_recipient = env.get(ENV_PREFIX + "LOCAL_RECIPIENT",
                                   cfg.local_recipient) or None
     cfg.aliases_file = env.get(ENV_PREFIX + "ALIASES_FILE", cfg.aliases_file)
+    if env.get(ENV_PREFIX + "MAX_TIME"):
+        cfg.max_time = _seconds(env[ENV_PREFIX + "MAX_TIME"],
+                                ENV_PREFIX + "MAX_TIME", EX_CONFIG)
 
     cfg.default_from = _single_address(cfg.default_from, "from")
     cfg.local_recipient = _single_address(cfg.local_recipient,
                                           "local_recipient")
     return cfg
+
+
+def _seconds(value: str, name: str, exit_code: int,
+             allow_zero: bool = True) -> float:
+    """Parse a finite, non-negative number of seconds."""
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = math.nan
+    if not math.isfinite(seconds) or not 0 <= seconds <= MAX_SECONDS \
+            or (seconds == 0 and not allow_zero):
+        # The value itself is not echoed: config values are interpolated
+        # and could expand to the client secret.
+        raise UserError(
+            f"invalid {name}: expected a number of seconds between "
+            f"{'0' if allow_zero else 'above 0'} and {MAX_SECONDS:.0f}"
+            f"{' (0 = no limit)' if allow_zero else ''}", exit_code)
+    return seconds
 
 
 def _single_address(value: str | None, key: str) -> str | None:
@@ -333,6 +449,7 @@ class Options:
         self.save_to_sent: bool | None = None
         self.verify = False                    # -bv: only show resolution
         self.noop_mode: str | None = None      # -bi / -bp
+        self.max_time: float | None = None     # --max-time
         # CLI mode fields
         self.to: list[str] = []
         self.cc: list[str] = []
@@ -360,6 +477,8 @@ common options:
   --config FILE          use this config file
   --save-to-sent / --no-save-to-sent
                          keep (or don't keep) a copy in the Sent Items folder
+  --max-time SECONDS     give up (exit 75) after this long in total;
+                         default 50, 0 = no limit
   --dry-run              print the Graph API payload instead of sending
   --verbose              debug output on stderr
   --version              print version and exit
@@ -373,7 +492,7 @@ project).  Full documentation: https://github.com/maciejczub/msgraph-sendmail
 # Long options that take a value.
 _LONG_WITH_VALUE = {
     "--to", "--cc", "--bcc", "--reply-to", "--subject", "--body",
-    "--body-file", "--attach", "--from", "--config",
+    "--body-file", "--attach", "--from", "--config", "--max-time",
 }
 _LONG_FLAGS = {
     "--html", "--dry-run", "--verbose", "--save-to-sent",
@@ -467,6 +586,8 @@ def _apply_long_value(opts: Options, name: str, value: str) -> None:
         opts.from_addr = value
     elif name == "--config":
         opts.config_path = value
+    elif name == "--max-time":
+        opts.max_time = _seconds(value, "--max-time", EX_USAGE)
 
 
 def _apply_long_flag(opts: Options, name: str) -> None:
@@ -1126,23 +1247,188 @@ class AddressResolver:
 # Microsoft Graph HTTP client
 # ---------------------------------------------------------------------------
 
-def _http_request(url: str, data: bytes, headers: dict,
-                  timeout: float) -> tuple[int, bytes, dict]:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: Graph and Entra ID don't redirect these
+    POSTs, and a followed redirect would blur whether our request was
+    already received (see NetworkError.maybe_sent).  Declining in the
+    http_error_30x hooks (before Location is parsed) lets the default
+    handler report the 3xx as a plain HTTPError."""
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        return None
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_302
+    http_error_308 = http_error_302
+
+
+def _open(request: urllib.request.Request, timeout: float,
+          context: ssl.SSLContext):
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=context), _NoRedirect())
+    return opener.open(request, timeout=timeout)
+
+
+def _http_request(url: str, data: bytes, headers: dict, timeout: float,
+                  on_accepted=None) -> tuple[int, bytes, dict]:
+    """POST *data*; return (status, body, headers) for any HTTP response.
+    Failures below HTTP raise NetworkError, classified by whether the
+    request may already have reached the server.  *on_accepted* is called
+    the moment a 202 status line arrives, before any cleanup."""
     request = urllib.request.Request(url, data=data, headers=headers,
                                      method="POST")
     context = ssl.create_default_context()
+    host = urllib.parse.urlsplit(url).netloc
     try:
-        with urllib.request.urlopen(request, timeout=timeout,
-                                    context=context) as response:
-            return response.status, response.read(), dict(response.headers)
+        response = _open(request, timeout, context)
+        try:
+            # Headers stay an HTTPMessage: case-insensitive lookups.
+            if response.status == 202:
+                # Accepted is final: never let a slow or broken (empty)
+                # body, or a failing close, turn it into a retry.
+                if on_accepted is not None:
+                    on_accepted()
+                return response.status, b"", response.headers
+            return response.status, response.read(), response.headers
+        finally:
+            try:
+                response.close()
+            except (OSError, http.client.HTTPException):
+                pass
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read(), dict(exc.headers or {})
-    except (urllib.error.URLError, OSError) as exc:
-        raise UserError(f"network error talking to {urllib.parse.urlsplit(url).netloc}: "
-                        f"{getattr(exc, 'reason', exc)}", EX_TEMPFAIL)
+        response_headers = exc.headers or http.client.HTTPMessage()
+        body = b""
+        retry_after = (_parse_retry_after(response_headers.get("Retry-After"))
+                       if _retryable_status(exc.code) else None)
+        try:
+            if retry_after is None or retry_after <= MAX_RETRY_AFTER:
+                # (no point reading a body we are going to give up on)
+                body = exc.read()
+        except (OSError, http.client.HTTPException):
+            pass
+        finally:
+            exc.close()
+        return exc.code, body, response_headers
+    except urllib.error.URLError as exc:
+        # urllib wraps everything up to and including sending the request
+        # (DNS, connect, TLS handshake, writing the body) in URLError.
+        reason = exc.reason
+        raise NetworkError(
+            f"{host}: {reason}", maybe_sent=False,
+            retryable=not isinstance(reason, ssl.SSLCertVerificationError))
+    except (OSError, http.client.HTTPException) as exc:
+        # Raised while waiting for / reading the response: the server may
+        # have processed the request already.
+        raise NetworkError(f"{host}: {exc or type(exc).__name__}",
+                           maybe_sent=True)
 
 
-def get_token(cfg: Config) -> str:
+def _parse_retry_after(value: str | None,
+                       now: float | None = None) -> float | None:
+    """Seconds to wait from a Retry-After header (delta-seconds or an
+    HTTP date); None if absent or unparseable."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+            if when is None:
+                return None
+            if when.tzinfo is None:
+                import datetime
+                when = when.replace(tzinfo=datetime.timezone.utc)
+            seconds = when.timestamp() - (time.time() if now is None
+                                          else now)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+    if math.isnan(seconds):
+        return None
+    return max(0.0, seconds)
+
+
+_STAGE_LABELS = {"token": "getting an access token",
+                 "send": "sending the message"}
+
+
+def _retryable_status(status: int) -> bool:
+    return status == 429 or 500 <= status < 600
+
+
+def _post_with_retries(stage: str, url: str, data: bytes, headers: dict,
+                       cfg: Config, deadline: Deadline,
+                       ) -> tuple[int, bytes, dict]:
+    """POST with retries on network errors, 429 and 5xx — within the
+    deadline, with exponential backoff and a bounded Retry-After.
+    Returns the first non-retryable HTTP response; raises EX_TEMPFAIL when
+    it has to give up."""
+    label = _STAGE_LABELS.get(stage, stage)
+    delay = RETRY_BASE_DELAY
+    attempt = 0
+    while True:
+        attempt += 1
+        _check_abort()
+        _PROGRESS.update(stage=stage, attempt=attempt)
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            raise UserError(
+                f"{label}: max_time of {deadline.max_time:g}s used up "
+                f"after {attempt - 1} attempt(s)", EX_TEMPFAIL)
+        note = ""
+        try:
+            if stage == "send":
+                status, body, response_headers = _http_request(
+                    url, data, headers, min(cfg.timeout, remaining),
+                    on_accepted=lambda: _PROGRESS.update(stage="done"))
+            else:
+                status, body, response_headers = _http_request(
+                    url, data, headers, min(cfg.timeout, remaining))
+        except NetworkError as exc:
+            problem = f"network error ({exc})"
+            if not exc.retryable:
+                raise UserError(f"{label}: {problem}", EX_TEMPFAIL)
+            if exc.maybe_sent and stage == "send":
+                note = ("; the request may have reached Graph, so the "
+                        "message may be delivered twice")
+            wait = delay
+        else:
+            if stage == "send" and status == 202:
+                # Record acceptance before anything else can block or be
+                # interrupted: from now on the outcome is "sent".
+                _PROGRESS.update(stage="done")
+            if not _retryable_status(status):
+                return status, body, response_headers
+            code, _ = _graph_error_details(body)
+            problem = f"HTTP {status}{' ' + code if code else ''}"
+            retry_after = _parse_retry_after(
+                response_headers.get("Retry-After"))
+            if retry_after is not None and retry_after > MAX_RETRY_AFTER:
+                raise UserError(
+                    f"{label}: {problem}; Graph asked to retry after "
+                    f"{retry_after:.0f}s (Retry-After), longer than the "
+                    f"{MAX_RETRY_AFTER:.0f}s we wait — giving up after "
+                    f"{deadline.elapsed():.1f}s", EX_TEMPFAIL)
+            wait = max(delay, retry_after or 0.0)
+
+        if attempt >= RETRY_ATTEMPTS:
+            raise UserError(
+                f"{label}: {problem}; giving up after {attempt} attempts "
+                f"({deadline.elapsed():.1f}s)", EX_TEMPFAIL)
+        if wait >= deadline.remaining():
+            raise UserError(
+                f"{label}: {problem}; no time left for another attempt "
+                f"within max_time={deadline.max_time:g}s "
+                f"({deadline.elapsed():.1f}s elapsed, attempt {attempt})",
+                EX_TEMPFAIL)
+        log_warning(f"{label}: {problem}; retrying in {wait:.0f}s "
+                    f"(attempt {attempt}/{RETRY_ATTEMPTS}){note}")
+        time.sleep(wait)
+        delay *= 2
+
+
+def get_token(cfg: Config, deadline: Deadline | None = None) -> str:
+    deadline = deadline or Deadline(cfg.max_time)
     url = f"{LOGIN_BASE}/{urllib.parse.quote(cfg.tenant)}/oauth2/v2.0/token"
     form = urllib.parse.urlencode({
         "client_id": cfg.client_id,
@@ -1154,10 +1440,13 @@ def get_token(cfg: Config) -> str:
         "Content-Type": "application/x-www-form-urlencoded",
         "User-Agent": f"{PROG}/{__version__}",
     }
-    status, body, _ = _http_request(url, form, headers, cfg.timeout)
+    status, body, _ = _post_with_retries("token", url, form, headers, cfg,
+                                         deadline)
     try:
         payload = json.loads(body)
     except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
         payload = {}
     if status != 200 or "access_token" not in payload:
         description = payload.get("error_description") or body[:300]
@@ -1169,15 +1458,25 @@ def get_token(cfg: Config) -> str:
 
 
 def _graph_error_details(body: bytes) -> tuple[str, str]:
+    """(code, message) from a Graph ({"error": {"code", "message"}}) or an
+    OAuth ({"error": "...", "error_description": "..."}) error body."""
     try:
-        error = json.loads(body).get("error", {})
-        return error.get("code", ""), error.get("message", "")
+        payload = json.loads(body)
     except ValueError:
         return "", body.decode("utf-8", "replace")[:300]
+    if not isinstance(payload, dict):
+        return "", ""
+    error = payload.get("error")
+    if isinstance(error, dict):
+        return str(error.get("code", "")), str(error.get("message", ""))
+    if isinstance(error, str):
+        return error, str(payload.get("error_description", ""))
+    return "", ""
 
 
 def send_message(cfg: Config, token: str, mailbox: str, graph_message: dict,
-                 save_to_sent: bool) -> None:
+                 save_to_sent: bool, deadline: Deadline | None = None) -> None:
+    deadline = deadline or Deadline(cfg.max_time)
     url = (f"{GRAPH_BASE}/users/{urllib.parse.quote(mailbox)}/sendMail")
     payload = json.dumps({
         "message": graph_message,
@@ -1197,43 +1496,23 @@ def send_message(cfg: Config, token: str, mailbox: str, graph_message: dict,
         "User-Agent": f"{PROG}/{__version__}",
     }
 
-    attempts = 4
-    delay = 2.0
-    for attempt in range(1, attempts + 1):
-        status, body, response_headers = _http_request(
-            url, payload, headers, cfg.timeout)
+    status, body, _ = _post_with_retries("send", url, payload, headers, cfg,
+                                         deadline)
+    if status == 202:
+        debug(f"Graph accepted the message (attempt {_PROGRESS['attempt']})")
+        return
 
-        if status == 202:
-            debug(f"Graph accepted the message (attempt {attempt})")
-            return
-
-        code, message = _graph_error_details(body)
-        retryable = status == 429 or 500 <= status < 600
-
-        if retryable and attempt < attempts:
-            retry_after = response_headers.get("Retry-After")
-            try:
-                wait = max(float(retry_after), delay) if retry_after else delay
-            except ValueError:
-                wait = delay
-            debug(f"HTTP {status} ({code}); retrying in {wait:.0f}s")
-            time.sleep(wait)
-            delay *= 2
-            continue
-
-        detail = f"HTTP {status} {code}: {message}".strip()
-        if status in (401, 403):
-            raise UserError(
-                f"Graph rejected the request — check the app's Mail.Send "
-                f"permission and admin consent ({detail})", EX_UNAVAILABLE)
-        if status == 404:
-            raise UserError(
-                f"mailbox {mailbox!r} not found or has no license ({detail})",
-                EX_UNAVAILABLE)
-        if retryable:
-            raise UserError(f"Graph unavailable after {attempts} attempts "
-                            f"({detail})", EX_TEMPFAIL)
-        raise UserError(f"Graph rejected the message ({detail})", EX_DATAERR)
+    code, message = _graph_error_details(body)
+    detail = f"HTTP {status} {code}: {message}".strip()
+    if status in (401, 403):
+        raise UserError(
+            f"Graph rejected the request — check the app's Mail.Send "
+            f"permission and admin consent ({detail})", EX_UNAVAILABLE)
+    if status == 404:
+        raise UserError(
+            f"mailbox {mailbox!r} not found or has no license ({detail})",
+            EX_UNAVAILABLE)
+    raise UserError(f"Graph rejected the message ({detail})", EX_DATAERR)
 
 
 # ---------------------------------------------------------------------------
@@ -1266,7 +1545,16 @@ def verify_addresses(resolver: AddressResolver, recipients: list[str]) -> int:
 
 
 def run(argv: list[str]) -> int:
-    global _VERBOSE
+    try:
+        return _run(argv)
+    finally:
+        _disarm_hard_stop()
+
+
+def _run(argv: list[str]) -> int:
+    global _VERBOSE, _DEADLINE
+    started = time.monotonic()
+    _PROGRESS.update(stage="startup", attempt=0, start=started)
 
     opts = parse_args(argv)
     _VERBOSE = opts.verbose
@@ -1279,10 +1567,23 @@ def run(argv: list[str]) -> int:
         return EX_OK
 
     cfg = load_config(opts.config_path)
+    if opts.max_time is not None:
+        cfg.max_time = opts.max_time
     resolver = AddressResolver(cfg)
 
+    # The budget covers everything from here on, including reading the
+    # message from stdin (a caller may never close it) and writing -bv /
+    # --dry-run output.
+    deadline = Deadline(cfg.max_time, start=started)
+    _DEADLINE = deadline
+    _arm_hard_stop(deadline)
+
     if opts.verify:
-        return verify_addresses(resolver, opts.recipients)
+        status = verify_addresses(resolver, opts.recipients)
+        sys.stdout.flush()
+        return status
+
+    _PROGRESS.update(stage="input")
 
     if opts.mode == "cli":
         graph_message = message_from_cli(opts)
@@ -1311,6 +1612,8 @@ def run(argv: list[str]) -> int:
         log_info("discarded: all recipients aliased to /dev/null ("
                  + ", ".join(resolver.discarded) + ")")
         return EX_OK
+
+    _check_abort()  # a SIGTERM swallowed while parsing the message
 
     if not graph_message.get("toRecipients") \
             and not graph_message.get("ccRecipients") \
@@ -1352,11 +1655,13 @@ def run(argv: list[str]) -> int:
             "saveToSentItems": save_to_sent,
             "message": graph_message,
         }, indent=2, ensure_ascii=False))
+        sys.stdout.flush()
         return EX_OK
 
+    _check_abort()
     require_config(cfg)
-    token = get_token(cfg)
-    send_message(cfg, token, mailbox, graph_message, save_to_sent)
+    token = get_token(cfg, deadline)
+    send_message(cfg, token, mailbox, graph_message, save_to_sent, deadline)
 
     recipients_summary = ", ".join(
         entry["emailAddress"]["address"]
@@ -1371,15 +1676,182 @@ def run(argv: list[str]) -> int:
     return EX_OK
 
 
-def main() -> None:
-    try:
-        sys.exit(run(sys.argv[1:]))
-    except UserError as exc:
-        log_error(str(exc))
-        sys.exit(exc.exit_code)
-    except KeyboardInterrupt:
-        sys.exit(EX_TEMPFAIL)
+_ABORT_SIGNALS = ("SIGTERM", "SIGHUP", "SIGINT", "SIGALRM")
+_ABORTING = False    # an Aborted is already on its way up
+_FINISHING = False   # main() is reporting the outcome; don't interrupt it
+_REPORTING = False   # SIGALRM now means "stop writing the final report"
+_PENDING_ABORT: str | None = None  # survives an Aborted swallowed by a
+                                   # bare except in library code
+_TIMER_ARMED = False  # ITIMER_REAL is ours to cancel
 
+
+class _ReportTimeout(BaseException):
+    pass
+
+
+def _on_signal(signum: int, frame) -> None:
+    global _ABORTING, _PENDING_ABORT
+    if _FINISHING:
+        if _REPORTING and signum == getattr(signal, "SIGALRM", None):
+            raise _ReportTimeout()
+        return  # never interrupt the final report with another abort
+    if _ABORTING:
+        return  # a second signal must not interrupt the first one
+    try:
+        name = signal.Signals(signum).name
+    except ValueError:
+        name = f"signal {signum}"
+    if name == "SIGALRM" and _DEADLINE is not None \
+            and _DEADLINE.remaining() <= 0.5:
+        reason = f"max_time of {_DEADLINE.max_time:g}s exceeded"
+    else:
+        reason = f"aborted by {name}"
+    _ABORTING = True
+    _PENDING_ABORT = reason
+    raise Aborted(reason)
+
+
+def _check_abort() -> None:
+    """Re-raise an abort that some library code swallowed (CPython's
+    email header parser has bare ``except:`` clauses)."""
+    if _PENDING_ABORT is not None and not _FINISHING:
+        raise Aborted(_PENDING_ABORT)
+
+
+def _install_signal_handlers(previous: dict | None = None) -> dict:
+    """Install our handlers, recording the previous ones in *previous*
+    (filled in before unmasking, which may deliver a pending signal)."""
+    previous = {} if previous is None else previous
+    for name in _ABORT_SIGNALS:
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            previous[signum] = signal.signal(signum, _on_signal)
+        except (OSError, ValueError, RuntimeError):
+            pass  # e.g. not the main thread
+    if previous and hasattr(signal, "pthread_sigmask"):
+        # A caller may have blocked these (the mask is inherited across
+        # exec); a blocked SIGALRM would silently disable max_time.
+        try:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, set(previous))
+        except (OSError, ValueError):
+            pass
+    return previous
+
+
+def _restore_signal_handlers(previous: dict) -> None:
+    for signum, handler in previous.items():
+        if handler is None:
+            continue  # installed outside Python; can't be restored
+        try:
+            signal.signal(signum, handler)
+        except (OSError, ValueError, RuntimeError, TypeError):
+            pass
+
+
+def _arm_hard_stop(deadline: Deadline) -> None:
+    """Backstop for max_time: socket timeouts bound each operation, not a
+    server that trickles bytes, so also arm a real-time timer.  Only when
+    our SIGALRM handler is installed (main()), never in library use."""
+    global _TIMER_ARMED
+    if not deadline.max_time or not _owns_sigalrm():
+        return
+    signal.setitimer(signal.ITIMER_REAL, max(deadline.remaining(), 0.01))
+    _TIMER_ARMED = True
+
+
+def _disarm_hard_stop() -> None:
+    global _TIMER_ARMED
+    if _TIMER_ARMED:  # only ever cancel a timer we set ourselves
+        _TIMER_ARMED = False
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def _owns_sigalrm() -> bool:
+    return hasattr(signal, "setitimer") \
+        and signal.getsignal(signal.SIGALRM) is _on_signal
+
+
+def _abort_outcome(reason: str) -> tuple[int, str]:
+    """Exit status and log line for a run stopped by a signal/timer."""
+    start = _PROGRESS.get("start")
+    elapsed = f" after {time.monotonic() - start:.1f}s" if start else ""
+    stage = _PROGRESS.get("stage", "startup")
+    attempt = _PROGRESS.get("attempt", 0)
+    where = f"stage: {stage}" + (f", attempt {attempt}" if attempt else "")
+    if stage == "done":
+        # Graph already accepted the message: report success, or the
+        # caller would send it again.
+        return EX_OK, (f"{reason}{elapsed} ({where}; the message had "
+                       f"already been accepted)")
+    if stage == "send":
+        outcome = "the message may or may not have been accepted"
+    else:
+        outcome = "the message was not sent"
+    return EX_TEMPFAIL, f"{reason}{elapsed} ({where}; {outcome})"
+
+
+def main() -> None:
+    global _ABORTING, _FINISHING, _REPORTING, _PENDING_ABORT, _DEADLINE
+    # Fresh state before any handler can fire.
+    _ABORTING = _FINISHING = _REPORTING = False
+    _PENDING_ABORT = None
+    _DEADLINE = None
+    _PROGRESS.clear()
+    _PROGRESS.update(stage="startup", attempt=0)
+    status, message = EX_OK, None
+    previous: dict = {}
+    try:
+        try:
+            _install_signal_handlers(previous)
+            status = run(sys.argv[1:])
+        except UserError as exc:
+            status, message = exc.exit_code, str(exc)
+    except Aborted as exc:          # also covers a signal hitting the
+        _FINISHING = True           # UserError handler above
+        status, message = _abort_outcome(exc.reason)
+    except KeyboardInterrupt:
+        _FINISHING = True
+        status, message = _abort_outcome("aborted by SIGINT")
+    finally:
+        _FINISHING = True
+    _disarm_hard_stop()
+    try:
+        _report(status, message)
+    finally:
+        _restore_signal_handlers(previous)
+    sys.exit(status)
+
+
+def _report(status: int, message: str | None) -> None:
+    """Write the final log line (syslog first, then stderr) and flush
+    pending output, giving up after a few seconds if e.g. a full pipe
+    blocks us — then discard what is left so exit can't block either."""
+    global _REPORTING
+    timer = _owns_sigalrm()
+    try:
+        try:
+            if timer:
+                _REPORTING = True
+                signal.setitimer(signal.ITIMER_REAL, 3.0)
+            if message and status == EX_OK:
+                log_warning(message)
+            elif message:
+                log_error(message)
+            for stream in (sys.stdout, sys.stderr):
+                if stream is not None:
+                    try:
+                        stream.flush()
+                    except (OSError, ValueError):
+                        _silence(stream)
+        finally:
+            _REPORTING = False      # before cancelling: a late SIGALRM
+            if timer:               # must not escape from here
+                signal.setitimer(signal.ITIMER_REAL, 0)
+    except _ReportTimeout:
+        _silence(sys.stdout)
+        _silence(sys.stderr)
 
 if __name__ == "__main__":
     main()

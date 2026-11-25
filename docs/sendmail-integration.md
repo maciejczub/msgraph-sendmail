@@ -98,10 +98,15 @@ directly is simpler and has fewer moving parts.)
 
 ## Things to know
 
-- **No queue.** If Graph is down, the tool retries briefly and exits 75.
-  Classic sendmail queues and retries for days. For cron/monitoring mail
-  this rarely matters; for must-not-lose mail, keep a queueing MTA in
-  front (see the postfix bridge above) or handle retries in the caller.
+- **No queue.** If Graph is down, the tool retries within its time budget
+  (`max_time`, default 50 s) and exits 75. Classic sendmail queues and
+  retries for days. For cron/monitoring mail this rarely matters; for
+  must-not-lose mail, keep a queueing MTA in front (see the postfix bridge
+  above) or retry in the caller — e.g. `Restart=on-failure` on the systemd
+  unit that sends the alert.
+- **Time budget.** Set `max_time` a few seconds below the time your caller
+  allows sendmail; see
+  [Time limits and retries](configuration.md#time-limits-and-retries).
 - **Envelope ≠ headers.** Recipients passed as arguments are used as the
   actual (To) recipients of the Graph message; with `-t` they are taken
   from `To:`/`Cc:`/`Bcc:` headers instead. `Bcc:` recipients are honoured

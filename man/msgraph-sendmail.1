@@ -87,6 +87,11 @@ Use an alternate configuration file.
 Keep (or don't keep) a copy in the sender's Sent Items folder.
 Default: keep.
 .TP
+.BI \-\-max\-time " seconds"
+Time budget for the whole run, including retries and pauses (default 50,
+0 = no limit). Overrides
+.BR max_time .
+.TP
 .B \-\-dry\-run
 Print the Graph API payload instead of sending.
 .TP
@@ -106,6 +111,7 @@ INI format, section [msgraph], keys:
 .BR from ,
 .BR save_to_sent ,
 .BR timeout ,
+.BR max_time ,
 .BR local_recipient ,
 .BR aliases_file ,
 .BR local_domains ;
@@ -134,10 +140,24 @@ writable by group or others. Local sender addresses (\fB\-f\fR, From:)
 are skipped when choosing the sending mailbox, so cron and daemon mail is
 sent from the configured
 .BR from .
+.SH TIME LIMITS AND RETRIES
+Each network operation is limited by
+.B timeout
+(default 15 s) and the whole run by
+.B max_time
+(default 50 s). Network errors, HTTP 429 and 5xx are retried up to 4
+times with pauses of 2, 4 and 8 s, honouring a Retry-After of at most
+30 s, but never beyond
+.BR max_time .
+A retry after the request may already have reached Graph can deliver the
+message twice; this is logged. When the budget runs out, or on SIGTERM,
+SIGHUP, SIGINT or SIGALRM, the tool logs the stage and elapsed time to
+syslog and exits 75.
 .SH EXIT STATUS
 BSD sysexits: 0 success, 64 usage error, 65 bad message, 67 unknown
 local address, 69 service
-refused (auth/permissions), 75 temporary failure (retry), 78
+refused (auth/permissions), 75 temporary failure, time budget exhausted or
+aborted by a signal (retry), 78
 configuration error.
 .SH FILES
 .I /etc/msgraph\-sendmail.conf

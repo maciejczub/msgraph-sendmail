@@ -23,8 +23,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   root/user-owned, not group/world-writable file of at most 1 MiB.
 - Syslog `sent` line includes `orig_to=` when local addresses were
   rewritten.
+- Overall time budget (#2): `max_time` config key, `--max-time` option and
+  `MSGRAPH_SENDMAIL_MAX_TIME` (default 50 s, `0` = no limit) cover the
+  token request, all attempts and pauses; a real-time timer enforces it.
+  Running out exits 75 with the stage and elapsed time in syslog.
+- Network errors are retried like HTTP 429/5xx, and the token request is
+  now retried as well. A retry after the request may already have reached
+  Graph is logged with a possible-duplicate warning. Every retry is logged
+  at warning level.
+- SIGTERM, SIGHUP, SIGINT and SIGALRM are logged to syslog
+  (`aborted by SIGTERM after 12.3s (stage: send, attempt 2; …)`) and exit
+  75, or 0 when Graph had already accepted the message.
+- Errors are written to syslog before stderr; a closed or full stderr
+  can no longer change the exit status or suppress the syslog entry.
 
 ### Changed
+- Default `timeout` lowered from 30 to 15 seconds (it applies to each
+  network operation; see `max_time` for the whole run).
+- `Retry-After` is honoured up to 30 s (seconds or HTTP date) and never
+  beyond `max_time`; a longer request ends the run with exit 75 at once
+  instead of sleeping.
+- Truncated responses (`IncompleteRead`) and OAuth-style error bodies
+  from Entra ID (`{"error": "temporarily_unavailable"}`) no longer escape
+  as a traceback.
+- HTTP redirects are no longer followed.
 - Config file errors (a stray `%`, syntax errors) are reported as exit 78
   with file, line and option names only — never the offending text, which
   could be the client secret. Previously a stray `%` crashed with a
